@@ -53,4 +53,4 @@ Drag the window to move it anywhere; drag the grip in its corner to set how tall
 
 Copyright (C) 2026 ReflectedReverb.
 
-RollFrames is free software under the [GNU General Public License v3.0](LICENSE): you can use, change and share it, and any version you release must stay under the same license.
+RollFrames is free software under the [GNU General Public License v3.0](https://github.com/reflectedreverb/RollFrames/blob/main/LICENSE): you can use, change and share it, and any version you release must stay under the same license.

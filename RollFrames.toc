@@ -8,5 +8,7 @@
 ## AddonCompartmentFuncOnEnter: RollFrames_OnAddonCompartmentEnter
 ## AddonCompartmentFuncOnLeave: RollFrames_OnAddonCompartmentLeave
 ## SavedVariables: RollFramesDB
+## X-Curse-Project-ID: 1793132
+## X-Wago-ID: EGPaDRN1
 
 RollFrames.lua

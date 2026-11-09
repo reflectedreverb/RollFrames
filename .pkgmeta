@@ -3,3 +3,7 @@ package-as: RollFrames
 ignore:
   - README.md
   - media
+
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown

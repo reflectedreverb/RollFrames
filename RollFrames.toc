@@ -1,6 +1,6 @@
 ## Interface: 16001
 ## Title: RollFrames
-## Notes: Group loot rolls, live, in a Blizzard-style window: everyone's Need, Greed or Pass as it happens, roll numbers, who's still deciding, the winner, and a compact history. Optional Need/Greed/Pass buttons. Light enough for 40-man raid nights.
+## Notes: Group loot rolls, live, in a Blizzard-style window: how many chose Need, Greed or Pass, your own roll, the winner (hover for everyone's rolls), and a saved history. Optional Need/Greed/Pass buttons. Light enough for 40-man raid nights.
 ## Author: ReflectedReverb
 ## Version: @project-version@
 ## IconTexture: Interface\Icons\INV_Misc_Dice_01
@@ -8,7 +8,9 @@
 ## AddonCompartmentFuncOnEnter: RollFrames_OnAddonCompartmentEnter
 ## AddonCompartmentFuncOnLeave: RollFrames_OnAddonCompartmentLeave
 ## SavedVariables: RollFramesDB
+## SavedVariablesPerCharacter: RollFramesHistory
 ## X-Curse-Project-ID: 1793132
 ## X-Wago-ID: EGPaDRN1
+## X-Website: https://github.com/reflectedreverb
 
 RollFrames.lua

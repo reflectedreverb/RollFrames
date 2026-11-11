@@ -3,18 +3,22 @@ A ReflectedReverb Addon, for World of Warcraft: Forever
 
 Group loot rolls, live, in one window that looks like Blizzard's own UI.
 
-Each drop gets a card with a line for every player from the start ("..." while
-they decide). Their Need, Greed or Pass appears the moment they pick it, with
-roll numbers as they're revealed: your own line first, then rolls in the order
-they came in, then players still deciding, then passes. A drop keeps the same
-height for its whole roll, so the roll buttons stay put as people choose.
-The winner is highlighted, then the card shrinks to a compact history row with
-the item, the winner and the boss it came from. Prefer less detail? Show one
-summary line per drop, or just the items.
+Each drop is one steady row: how many chose Need, Greed and Pass (as their
+icons), your own choice and roll, and the winner with their roll the moment
+it's decided. Hover a drop for everyone's rolls (in a raid: the Need rolls and
+a count of the rest). Prefer more detail? Player lines: Everyone gives each
+player a line.
 
-Optional Need, Greed and Pass buttons on each card. While they're on and the
+History: decided drops move under the clock in the title bar after a minute,
+or as soon as the window fades out; click the clock to bring them back. It's
+kept for each character across reloads (100 drops by default); the X clears
+it, after asking.
+
+Optional Need, Greed and Pass buttons on each drop. While they're on and the
 window is open, Blizzard's roll popups stay hidden; if anything goes wrong, or
-you close the window, Blizzard's popups come back.
+you close the window, Blizzard's popups come back. When new loot moves the
+list, buttons that slide under a still mouse ignore clicks for a moment, so a
+click meant for one item can't land on another.
 
 This tracks group loot rolls (Need, Greed and Pass), not /roll number rolls.
 
@@ -33,7 +37,9 @@ USE
 /rollframes demo       Play three made-up drops, so you can see it without a group
                        (/rollframes demo 10 for more, up to 20)
 /rollframes options    Open the settings (also under Options > AddOns > RollFrames)
-/rollframes reset      Put the window back above the roll popups at its normal size
+/rollframes reset      Put the window back in its starting spot at its normal size
+/rollframes reset all  Start over completely, after asking: every setting, the
+                       window, and this character's loot history (reloads)
 /rollframes blizzard   Open Blizzard's own loot history
 /rollframes diag       A short status for bug reports (no names)
 /rollframes diag log   Turn a troubleshooting log on or off (saved with your
@@ -42,39 +48,51 @@ USE
 The AddOns button by the minimap also works: left-click shows or hides the
 window, right-click opens the settings.
 
-Drag the window to move it; drag the grip in its corner to set how tall it may
-grow. Longer lists scroll.
+The window opens on the right, beside the quest tracker. Drag its title bar to
+move it; drag the grip in its corner to set its height (in whole rows). Longer
+lists scroll. With nothing in it yet, it offers a "Try the demo" button.
 
 
-SETTINGS
+SETTINGS (Options > AddOns > RollFrames)
 
+Window
 Open when a roll starts      Show the window when a group loot roll starts (on).
-                             Off: it stays in the background and keeps track;
-                             open it yourself when you want it. While it's
+                             Off: it keeps track in the background. While it's
                              closed, Blizzard's roll popups show as usual.
 Roll from this window        Need, Greed and Pass buttons on each drop (off).
                              Two copies of one item at once: a click uses
                              either of your rolls on it; your choice shows on
                              the copy the game reports it for.
-Player lines                 Auto (default: Everyone in a party, Summary in
-                             a raid), Everyone (a line per player), Summary
-                             (one line of counts; hover for everyone's rolls)
-                             or None (just the items, with your own choice)
-Position                     Attached above the roll popups (default), or free
-Fixed window height          Keep the height you set with the corner grip;
-                             longer lists scroll (off)
-Show rolls after a winner    How long the full list stays (5 seconds)
+Player lines                 Summary (default: one row per drop; hover for
+                             everyone's rolls), Auto (a line per player in a
+                             party, Summary in a raid), Everyone, or None
+Click guard                  On, 2 seconds (or half a second to 5 seconds, or
+                             until the mouse moves); a guarded click plays a
+                             short sound
+Position                     Free (default: beside the quest tracker until you
+                             drag it) or Above roll popups
+Grow with drops              Grow with the drops up to the height you set (off)
 Hide when idle after         Fade once everything is decided and quiet
-                             (15 seconds, or never). A window you open
+                             (15 seconds, or never; hovering restarts it). A window you open
                              yourself stays until you close it (the pin by
                              the close button is lit; click it to switch).
-Hovering stops the fade      Hovering keeps the window from fading (on)
-Minimum quality kept         Lowest quality kept as a history row once a roll
-                             is decided: all items (default), or uncommon /
-                             rare / epic and better. Rolls of any quality
-                             always show while they run; every drop is still
-                             in Blizzard's loot history (/loot).
-Keep trash drops             Off: only boss loot stays in the history (on)
-History length               Finished drops listed as compact rows (10).
-                             Older ones leave the list; Blizzard's loot
-                             history (/loot) still has them.
+
+History
+Minimum quality kept         All items (default), or uncommon / rare / epic and
+                             better. Lower items fade out once decided and
+                             aren't kept in History. Every drop is still in
+                             Blizzard's loot history (/loot).
+Keep trash drops             Off: only boss loot stays once decided (on)
+History keeps                Decided drops kept for this character (100)
+Finished drops stay          How long a decided drop stays in the list before
+                             it moves to History (1 minute, or until cleared)
+
+Accessibility
+Highlight drops to roll      Gold border (default), glowing timer bar,
+                             sparkles, all three, or off (needs Roll from this
+                             window)
+Flashing                     Normal (default), Until noticed, or Off
+
+MORE ADDONS
+
+More addons by ReflectedReverb: https://github.com/reflectedreverb

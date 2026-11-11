@@ -63,13 +63,14 @@ local STATE_ATLAS = {
 	[2] = "lootroll-toast-icon-transmog-up", [3] = "lootroll-toast-icon-greed-up",
 	[5] = "lootroll-toast-icon-pass-up",
 }
--- RollOnLoot roll types, right to left: Need, Greed and Pass always in these spots; Transmog to the left
--- of Pass, shown only on a roll that allows it (none seen on Forever so far), so the others never move.
+-- RollOnLoot roll types. Left to right on screen: Need, Greed, Pass, as on Blizzard's roll popup (Need on
+-- the left, Pass on the right), always in these spots. `spot` counts from the right edge. Transmog goes to
+-- the left of Need, shown only on a roll that allows it (none seen on Forever so far), so the others never move.
 local ROLL_BUTTONS = {
-	{ type = 1, atlas = "lootroll-toast-icon-need", label = "Need", can = "canNeed" },
-	{ type = 2, atlas = "lootroll-toast-icon-greed", label = "Greed", can = "canGreed" },
-	{ type = 0, atlas = "lootroll-toast-icon-pass", label = "Pass" },
-	{ type = 4, atlas = "lootroll-toast-icon-transmog", label = "Transmog", can = "canTransmog", onlyIfAllowed = true },
+	{ type = 1, atlas = "lootroll-toast-icon-need", label = "Need", can = "canNeed", spot = 2 },
+	{ type = 2, atlas = "lootroll-toast-icon-greed", label = "Greed", can = "canGreed", spot = 1 },
+	{ type = 0, atlas = "lootroll-toast-icon-pass", label = "Pass", spot = 0 },
+	{ type = 4, atlas = "lootroll-toast-icon-transmog", label = "Transmog", can = "canTransmog", onlyIfAllowed = true, spot = 3 },
 }
 ROLL_BUTTONS.can = {} -- what the current roll allows (see cardRollTypes)
 
@@ -1778,10 +1779,10 @@ local function createButtons(card)
 	-- this window" off, the default, they never are: 4 buttons and 12 textures less for every drop.
 	function bar.build()
 		bar.build = nil
-		for i, spec in ipairs(ROLL_BUTTONS) do
+		for _, spec in ipairs(ROLL_BUTTONS) do
 			local button = CreateFrame("Button", nil, bar)
 			button:SetSize(20, 20)
-			button:SetPoint("RIGHT", bar, "RIGHT", -(i - 1) * 22, 0)
+			button:SetPoint("RIGHT", bar, "RIGHT", -spec.spot * 22, 0)
 			button:SetNormalAtlas(spec.atlas .. "-up")
 			button:SetHighlightAtlas(spec.atlas .. "-highlight")
 			button:SetPushedAtlas(spec.atlas .. "-down")
@@ -5520,11 +5521,11 @@ function Ask.create()
 	row.choice:SetPoint("TOPRIGHT", -8, -5)
 	row.choice:Hide()
 	row.buttons = {}
-	for i, spec in ipairs(ROLL_BUTTONS) do
+	for _, spec in ipairs(ROLL_BUTTONS) do
 		if spec.type ~= 4 then -- (no Transmog in the sample)
 			local b = CreateFrame("Button", nil, row)
 			b:SetSize(20, 20)
-			b:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4 - #row.buttons * 22, -4)
+			b:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4 - spec.spot * 22, -4)
 			b:SetNormalAtlas(spec.atlas .. "-up")
 			b:SetHighlightAtlas(spec.atlas .. "-highlight")
 			b:SetPushedAtlas(spec.atlas .. "-down")

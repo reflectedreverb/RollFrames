@@ -1,5 +1,9 @@
 # RollFrames
 
+## v1.2.1
+
+- **Roll buttons in Blizzard's order.** Need, Greed and Pass now read left to right, with Pass on the right, like Blizzard's roll popup. Each still keeps a fixed spot on every drop.
+
 ## v1.2.0
 
 - **A calmer window by default.** It now sits on the right, beside the quest tracker, out of the way of your action bars, and keeps one size. Every drop is one steady row: the item, how many chose Need, Greed and Pass, and your own choice. Hover a drop for everyone's rolls (in a raid, the Need rolls and a count of the rest). Prefer the old way? Options: Position "Above roll popups", Player lines "Auto" or "Everyone".

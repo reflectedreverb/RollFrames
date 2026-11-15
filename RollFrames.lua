@@ -1,41 +1,15 @@
 -- RollFrames: live group loot rolls in one Blizzard-style window.
--- Each drop gets a card. While rolls are open, every player has a line from the start ("..." until
--- they choose): your own first, then rolls in the order they came in, then players still deciding,
--- then passes. Choosing moves a line within the card, so the card's height (and your roll buttons) stay
--- put. "Player lines" can show a one-line summary or nothing instead. When a winner is picked, their
--- line is highlighted with a sweep, the rolls stay a few seconds, then the card collapses to a compact
--- row: item (hover for tooltip), winner, and the boss it came from.
--- Data: C_LootHistory (Blizzard's loot history, built into Forever) plus START_LOOT_ROLL for
--- the roll timer and optional Need/Greed/Pass buttons (RollOnLoot).
--- Commands: /rollframes | demo | options | reset | blizzard | diag
+-- Data: C_LootHistory plus START_LOOT_ROLL for the roll timer and RollOnLoot buttons.
+-- Commands: /rollframes | demo | options | size | reset | reset all | blizzard | diag | diag log
 
 local ADDON = "RollFrames"
--- Grey footer at the end of the settings page. Set to "" to leave the spot blank.
+-- "" leaves the footer blank.
 local FOOTER = "ReflectedReverb Addons"
 
--- The footer row: a section header without the hover tooltip every header gets (it would only repeat
--- the text). The settings list reuses rows for other headers, so the row's mouse settings come back when it lets go.
+-- Blizzard's plain header, no InitFrame/Resetter of our own: the settings list reads a row's Resetter outside
+-- its taint barrier, and the next list drawn (Social's Discord row) is then blocked and blamed on us.
 local function footerInitializer()
-	local init = CreateSettingsListSectionHeaderInitializer("|cff8c8c8c" .. FOOTER .. "|r")
-	local initFrame, resetter = init.InitFrame, init.Resetter
-	local mouse = {} -- row -> its mouse settings before the footer turned them off
-	function init:InitFrame(frame)
-		initFrame(self, frame)
-		if not mouse[frame] then
-			mouse[frame] = { frame:IsMouseClickEnabled(), frame:IsMouseMotionEnabled() }
-		end
-		frame:EnableMouse(false)
-	end
-	function init:Resetter(frame)
-		local was = mouse[frame]
-		if was then -- put back exactly what the row had, for the header that reuses it
-			frame:SetMouseClickEnabled(was[1])
-			frame:SetMouseMotionEnabled(was[2])
-			mouse[frame] = nil
-		end
-		resetter(self, frame)
-	end
-	return init
+	return CreateSettingsListSectionHeaderInitializer("|cff8c8c8c" .. FOOTER .. "|r")
 end
 
 -- Layout
@@ -44,17 +18,14 @@ local SIDE_PAD = 10
 local TITLE_H = 28
 local BOTTOM_PAD = 10
 local CARD_GAP = 4
-local HEADER_H = 34
+local HEADER_H = 34 -- grows with roll button size: Scale.setRows
 local ICON = 28
 local LINE_H = 18
--- Heights are whole-row steps (History.snapHeight: 38 per row plus 56).
-local MAX_HEIGHT = 550 -- default for the user's height limit (db.maxHeight) when the window grows: 13 rows
-local FIXED_HEIGHT = 322 -- default height of a window that doesn't grow (db.height): 2 live 5-man drops, or 7 rows
-	-- with the "more to roll" bar clear below them (user, 2026-11-10)
--- Never shorter than two compact rows: Blizzard's panel template draws broken corners on a shorter window
--- (tried one row in game, 2026-11-08).
+-- Heights are whole snap steps: 56 + rows * ROW_H (History.snapHeight).
+local MAX_HEIGHT = 550 -- db.maxHeight default: 13 rows
+local FIXED_HEIGHT = 322 -- db.height default: 7 rows, or 2 live 5-man drops
+-- Two compact rows: any shorter and Blizzard's panel template draws broken corners.
 local MIN_HEIGHT = TITLE_H + 2 * HEADER_H + CARD_GAP + BOTTOM_PAD
-local SCROLLBAR_W = 10 -- space kept on the right for the scrollbar when the list scrolls
 
 -- Enum.EncounterLootDropRollState: NeedMainSpec 0, NeedOffSpec 1, Transmog 2, Greed 3, NoRoll 4, Pass 5.
 local STATE = { NEED = 0, NEED_OFF = 1, TRANSMOG = 2, GREED = 3, NOROLL = 4, PASS = 5 }
@@ -74,8 +45,7 @@ local ROLL_BUTTONS = {
 }
 ROLL_BUTTONS.can = {} -- what the current roll allows (see cardRollTypes)
 
--- Where a player's line sits in a card: you on top, then rolls in the order they came in, then the
--- players still deciding, then passes. Lines only trade places, so one choice moves two lines at most.
+-- Line order in a card. Lines only trade places, so one choice moves two lines at most.
 local GROUP_YOU, GROUP_ROLLED, GROUP_DECIDING, GROUP_PASSED = 1, 2, 3, 4
 -- A roll button's choice as the loot history reports it.
 local CLICK_STATE = { [1] = STATE.NEED, [2] = STATE.GREED, [4] = STATE.TRANSMOG, [0] = STATE.PASS }
@@ -83,47 +53,53 @@ local CLICK_STATE = { [1] = STATE.NEED, [2] = STATE.GREED, [4] = STATE.TRANSMOG,
 local DEFAULTS = {
 	autoOpen = true,
 	rollFromWindow = false,
-	-- "auto" (Everyone in parties, Summary in raids), "all" (a line per player), "summary" (one line of
-	-- counts) or "none" (item row only)
-	playerLines = "summary", -- (Auto until 2026-11-10: the user chose one calm row per drop for everyone)
+	-- "auto" (Everyone in parties, Summary in raids), "all", "summary" or "none"
+	playerLines = "summary",
 	-- Drops waiting for your roll (their roll buttons show, so only with rollFromWindow): "border" (a pulsing
 	-- gold frame), "timer" (the timer bar glows, with a spark at its edge), "sparkle", "all" or "off".
 	highlightRolls = "border",
+	hoverGlow = true, -- Accessibility: a gold glow behind the roll button under the mouse
+	-- Off (or flashing "off"): no sweep; your wins keep a tint.
+	resultSweep = true,
+	noMotion = false, -- "No animations": everything at once, nothing flashes, pulses or sweeps
+	-- "small" (20 px), "medium" (25), "large" (28) or "xlarge" (32, Blizzard's popup size): Scale.LOOK
+	rollButtons = "medium",
 	-- Accessibility: "normal" (pulses, sweeps, one flash when new loot brings the window back from History),
 	-- "persist" (that flash repeats until you hover the window) or "off" (nothing flashes or pulses).
 	flashing = "normal",
 	keepTrash = true, -- false: drops from trash (encounter 0) leave the history once decided
-	position = "free", -- or "attached" (the default until 2026-11-10); free and never dragged: right of centre
-	-- Internal, no longer settings (removed from Options 2026-11-10, user: simpler; what they were and how to
-	-- bring them back: docs/rollframes-removed-settings.md). Kept as values because tests still use them.
+	position = "free", -- internal; "attached" (above Blizzard's popups) is no longer offered
+	-- Internal, no longer in Options. Kept as values because tests still use them.
 	newOrder = "top", -- new drops appear "top" (older below, History under them) or "bottom"
 	hoverHold = "off", -- what holds the list under the mouse: "off", "buttons" or "window"
-	snapRows = true, -- heights in whole-row steps (History.snapHeight)
 	holdSeconds = 5, -- how long a decided drop shows its result before it becomes a history row
 	-- Click guard: roll buttons that slide under a still cursor (the list moved) ignore clicks, dimmed, for
 	-- guardTime seconds or until the mouse moves a button's width (guardTime 0: only when the mouse moves).
 	buttonGuard = true,
 	guardTime = 2,
 	autoHide = 15, -- seconds after the last activity; 0 = never
-	historyCount = 20, -- decided rows kept in the list (fixed, no setting since 2026-11-10; the rest are in History)
+	historyCount = 20, -- decided rows kept in the list (fixed; the rest are in History)
 	historyKeep = 100, -- decided drops History keeps (saved per character across reloads): 50/100/250/500
 	historyFade = 60, -- seconds a decided drop stays in the list before it fades into History; 0 = until cleared
 	historyMinQuality = 0, -- 0 = keep every item in the history; 2/3/4 = uncommon/rare/epic and better
-	-- The window keeps one height (db.height, set by dragging its corner; longer lists scroll) unless the player
-	-- turns on "Grow with drops": then it grows with its drops up to db.maxHeight (also set by dragging).
+	-- Fixed height (db.height) unless autoGrow: then it grows with its drops up to db.maxHeight.
 	autoGrow = false,
 	height = FIXED_HEIGHT,
+	-- Corner drags move a whole row at a time.
+	snapDrag = false,
+	itemTooltip = "drop", -- where a drop's item tooltip shows: "drop" (anywhere on it) or "icon" (its icon only)
+	buttonTips = true, -- a small tip by the roll button under the mouse (its roll, why not, the guard)
+	tooltipGameSpot = false, -- "Tooltips at game's spot": item tooltips at the game's own place, not beside the window
 	maxHeight = MAX_HEIGHT,
+	windowSize = 100, -- Window size: percent, 75 to 200; the whole window scales (text, icons, rows)
 }
 
--- Saved settings hold only real choices (see Saved, below): a setting the player never changed isn't stored,
--- so reading it gives the current default, and changing a default here reaches everyone who didn't choose
--- otherwise. Change defaults freely; add a Saved.MIGRATIONS step only to carry choices across a rename or a
--- changed meaning.
+-- Saved settings hold only real choices: an unset one reads the current default, so defaults can change
+-- freely. Add a Saved.MIGRATIONS step only for a rename or changed meaning.
 local Saved = {
-	-- Saved values that aren't settings (kept as they are). Anything else that isn't a setting is removed at
-	-- login (settings that no longer exist).
+	-- Saved values that aren't settings. Any other non-setting key is removed at login.
 	STATE = { point = true, log = true, pairLog = true, askedRollHere = true, askClosed = true, debugLog = true,
+		demoHidden = true, -- ("Don't show this again" under the empty window's demo button)
 		settingsVersion = true, historySaved = true, lastError = true },
 	-- v1.1.0's defaults: it saved every setting, defaults included, so a v1.1 file's values equal to these
 	-- weren't choices (step 2 removes them).
@@ -150,39 +126,14 @@ Saved.MIGRATIONS[2] = function(db) -- v1.1 -> v1.2
 	db.holdSeconds = nil -- ("Show rolls after a winner" left Options in v1.2: everyone gets 5 s)
 	if rawget(db, "historyKeep") == 0 then db.historyKeep = nil end -- (a dev build's "All", no longer offered)
 	if rawget(db, "historyFade") == 120 then db.historyFade = nil end -- (a dev build's default)
-	-- The two defaults a v1.1 player sees change (left at v1.1's, so they follow the new ones): one chat line,
-	-- once (this step only ever runs once), saying what changed and how to go back (user, 2026-11-10).
-	-- REMOVE in the release after v1.2: by then upgraders have seen it (docs/todo/RollFrames.md, "Later").
-	local moved = rawget(db, "position") == nil or (rawget(db, "position") == "free" and rawget(db, "point") == nil)
-	local lines = rawget(db, "playerLines") == nil
-	if moved or lines then
-		Saved.upgradeNote = { moved = moved, lines = lines }
+end
+-- v1.2 -> v1.3: "Above roll popups" left Options; a window kept there moves to the starting spot.
+Saved.MIGRATIONS[3] = function(db)
+	if rawget(db, "position") == "attached" then
+		db.position, db.point = nil, nil
 	end
 end
-Saved.LATEST = 2
-
--- The upgrade note (see MIGRATIONS[2]); shown a few seconds after login. REMOVE with it.
-function Saved.showUpgradeNote()
-	local n = Saved.upgradeNote
-	Saved.upgradeNote = nil
-	if not n then
-		return
-	end
-	local where = "Options > AddOns > RollFrames"
-	local text
-	if n.moved and n.lines then
-		text = "the window now sits on the right, beside the quest tracker, with one row per drop (hover a drop "
-			.. "for everyone's rolls). To go back: " .. where .. ", Position: Above roll popups, Player lines: Auto."
-	elseif n.moved then
-		text = "the window now sits on the right, beside the quest tracker. To put it back above Blizzard's roll "
-			.. "popups: " .. where .. ", Position: Above roll popups."
-	else
-		text = "each drop is now one row (hover it for everyone's rolls). For a line per player again: "
-			.. where .. ", Player lines: Auto."
-	end
-	print("|cff66ccffRollFrames|r was updated: " .. text .. " Finished drops now move under the clock (History) "
-		.. "in the title bar.") -- (say() is defined further down)
-end
+Saved.LATEST = 3
 
 -- Drops what isn't a choice: values equal to their current default, and keys that are neither settings nor
 -- saved state. Runs at login and logout, so the saved file only ever holds real choices.
@@ -208,6 +159,19 @@ function Saved.load(db)
 		end
 	end
 	db.settingsVersion = math.max(tonumber(rawget(db, "settingsVersion")) or 0, Saved.LATEST) -- (never lower it)
+	-- A damaged file mustn't reach the game's own calls: the window's spot goes to SetPoint, the size to Blizzard's
+	-- slider. Unusable values are dropped (the default, or the starting spot, instead).
+	local point = rawget(db, "point")
+	if point ~= nil and not (type(point) == "table" and type(point[1]) == "string" and type(point[2]) == "string"
+		and type(point[3]) == "number" and type(point[4]) == "number") then
+		db.point = nil
+	end
+	for key, default in pairs(DEFAULTS) do -- (every setting: a value of the wrong type is dropped)
+		local v = rawget(db, key)
+		if v ~= nil and type(v) ~= type(default) then
+			db[key] = nil
+		end
+	end
 	Saved.prune(db)
 	setmetatable(db, { __index = DEFAULTS }) -- a setting not stored reads as its default
 end
@@ -228,15 +192,28 @@ local holdWatch -- frame that waits for a held card to let go (see heldCard)
 local askShown = false -- the "Roll from this window?" question is showing (see "First-use question")
 local askPutAway = false -- put away unanswered for combat: back a few seconds after the fight
 local maybeAsk, hideAsk, Ask -- forward declarations (defined with the question; Ask is its table)
--- History (the clock in the title bar): records of drops decided this session, newest first. The clock
--- brings back the ones that have left the list as rows that continue it on its older side; only the rows
--- in view have a frame (reused as you scroll). Demo drops keep their own records, so a demo never touches
--- your real history.
+-- History (the clock in the title bar): records of drops decided this session, newest first, shown as
+-- rows continuing the list; only rows in view have a frame. Demo drops keep their own records.
+-- Functions live on History because the file is at Lua's 200-locals limit.
 local History = { records = {}, demo = {}, merged = {}, rows = {}, shown = false, top = 0, seq = 0,
 	MAX = 500, ROW_H = HEADER_H + CARD_GAP,
 	byMark = {}, -- drop mark (item link @ start time) -> its record, so a drop seen again (a reload) isn't added twice
 	cardOf = setmetatable({}, { __mode = "k" }), -- record -> { card, gen } while its card may still be listed
 }
+
+-- Roll buttons in the window: "Roll from this window", except in controller mode, where the game sends every roll
+-- to its own gamepad roll list (Blizzard's GamepadGroupLootRollFrame; RollFrames never hides it), so buttons here
+-- would only duplicate it. The setting keeps its value and applies again without a controller.
+function History.rollsHere()
+	if not db.rollFromWindow then
+		return false
+	end
+	if not (InputUtil and InputUtil.IsGamepadUIEnabled) then
+		return true
+	end
+	local ok, pad = pcall(InputUtil.IsGamepadUIEnabled)
+	return not (ok and pad)
+end
 -- "encounterID:lootListKey" -> the drop left out of the list (faded, trimmed, cleared or filtered): later
 -- updates for that drop are ignored. The value is the drop's mark (item link and start time; true when not
 -- known), so if the game ever reused a key for a different drop, that drop is still new loot.
@@ -442,10 +419,9 @@ end
 
 -- Runs fn(progress 0..1, eased) over duration seconds; a new tween with the same key replaces the old one.
 local function tween(key, duration, fn, done, linear)
-	-- Nobody can see an animation while the window is hidden: jump straight to the end (measured: 29 ms/s
-	-- of animation with the window closed in the stress test). Nothing is ever mid-flight when it opens.
-	-- Animations switched off after repeated errors (Guard.animationFailed) jump to the end the same way.
-	if Guard.off.animations or (main and not main:IsVisible()) then
+	-- Hidden window: jump to the end (animating while closed cost 29 ms/s in the stress test).
+	-- Same when animations are off after errors (Guard.animationFailed).
+	if Guard.off.animations or (db and db.noMotion) or (main and not main:IsVisible()) then
 		tweens[key] = nil
 		local ok, err = pcall(fn, 1)
 		if ok and done then
@@ -521,7 +497,9 @@ driver:SetScript("OnUpdate", function(self, elapsed)
 	if profileStart then
 		self.ms = self.ms + debugprofilestop() - profileStart
 	end
-	if next(tweens) == nil then
+	-- (Work queued this frame for the next, e.g. by the layout above, keeps it running.)
+	local shown = main and main:IsShown()
+	if next(tweens) == nil and not History.guardCheck and not ((relayoutPending or markersDirty) and shown) then
 		self:Hide()
 	end
 end)
@@ -551,17 +529,283 @@ function Guard.animationFailed(err)
 	end
 end
 
+-- Flashing Off, or No animations: nothing flashes, pulses or sweeps.
+function History.noFlash()
+	return db.flashing == "off" or db.noMotion == true
+end
+
+-- "No animations" switched on: every Lua animation still running ends where it would (as after errors).
+function History.finishTweens()
+	local running = {}
+	for k, t in pairs(tweens) do
+		running[#running + 1] = t
+		tweens[k] = nil
+	end
+	for _, t in ipairs(running) do
+		if pcall(t.fn, 1) and t.done then
+			pcall(t.done)
+		end
+	end
+end
+
+-- Native fades: an Alpha animation the engine plays, so nothing runs per frame. The region's own alpha is
+-- set to the end value at once and the animation shows the way there; `done` runs on a timer, so it runs
+-- even if the region hides meanwhile. A fade over a fade starts where the first had got to. Anything that
+-- sets a fading region's alpha directly goes through History.setAlpha, or the animation would cover it.
+function History.fadeOf(region)
+	local fade = region.rfFade
+	if fade or History.noFade then
+		return fade
+	end
+	local ok, made = pcall(function()
+		local group = region:CreateAnimationGroup()
+		local anim = group:CreateAnimation("Alpha")
+		anim:SetSmoothing("OUT")
+		return { group = group, anim = anim, token = 0 }
+	end)
+	if not ok then
+		History.noFade = true -- (this client can't: alphas are set at once from now on)
+		return nil
+	end
+	region.rfFade = made
+	return made
+end
+
+-- The alpha on screen: part way through a fade, where it has got to.
+function History.shownAlpha(region)
+	local fade = region.rfFade
+	if fade and fade.group:IsPlaying() then
+		local ok, p = pcall(fade.anim.GetSmoothProgress, fade.anim)
+		if ok and type(p) == "number" then
+			return fade.from + (fade.to - fade.from) * p
+		end
+	end
+	return region:GetAlpha()
+end
+
+function History.stopFade(region)
+	local fade = region.rfFade
+	if fade then
+		fade.token = fade.token + 1 -- (its `done` won't run)
+		-- Always: a fade on a frame hidden mid-play is paused, not playing, and would hold its alpha
+		-- when the frame is reused (a pooled player line came back invisible).
+		fade.group:Stop()
+	end
+end
+
+function History.setAlpha(region, alpha)
+	if region.rfFade then
+		History.stopFade(region)
+	end
+	region:SetAlpha(alpha)
+end
+
+
+-- A drop row and its player lines fade in Lua, not with the engine. When an engine fade on a frame starts, plays
+-- and ends, the game puts back the alpha of what's inside it: parts that had faded before go back to that fade's
+-- alpha, and alpha set while it plays is undone when it ends. Reused player lines came back invisible and Click
+-- guard's dim was lost. Engine fades are for single parts and for frames whose contents never change alpha.
+-- from: where it starts (default: where it is).
+function History.fadeRow(card, to, duration, done, from)
+	local f = card.frame
+	from = from or f:GetAlpha()
+	if from ~= to and main and main:IsVisible() and not (db and db.noMotion) and not Guard.off.animations then
+		f:SetAlpha(from) -- (now: the tween's first step is next frame)
+	end
+	tween(card.id .. ":rowfade", duration, function(p)
+		f:SetAlpha(from + (to - from) * p)
+	end, done)
+end
+
+function History.fadeLinesOut(card)
+	local from = {}
+	for _, line in pairs(card.lines) do
+		from[line] = line:GetAlpha()
+	end
+	if next(from) == nil then
+		return
+	end
+	tween(card.id .. ":linesout", 0.35, function(p)
+		for line, a in pairs(from) do
+			line:SetAlpha(a * (1 - p))
+		end
+	end)
+end
+
+function History.fade(region, to, duration, done, from)
+	from = from or History.shownAlpha(region)
+	History.stopFade(region)
+	local fade = from ~= to and not Guard.off.animations and not (db and db.noMotion) and main and main:IsVisible()
+		and History.fadeOf(region)
+	region:SetAlpha(to)
+	if fade then
+		fade.from, fade.to = from, to
+		fade.anim:SetFromAlpha(from)
+		fade.anim:SetToAlpha(to)
+		fade.anim:SetDuration(duration)
+		fade.group:Play()
+	end
+	if not done then
+		return
+	end
+	if not fade then
+		local ok, err = pcall(done) -- (no fade: at once, as a tween in a hidden window)
+		if not ok then
+			Guard.animationFailed(err)
+		end
+		return
+	end
+	local token = fade.token
+	C_Timer.After(duration, function()
+		if fade.token == token then
+			local ok, err = pcall(done)
+			if not ok then
+				Guard.animationFailed(err)
+			end
+		end
+	end)
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Main window
 ----------------------------------------------------------------------------------------------------
 
--- Saved by the top-left corner, so a height change grows or shrinks the window downward.
--- Roll buttons appeared or went somewhere, or the list scrolled: recount the markers next frame.
+-- Recount the "more to roll" markers next frame.
 local function requestMarkers()
 	markersDirty = true
 	driver:Show()
 end
 
+-- Window size. The window's own units are the screen's times its scale, so a position or height read
+-- from another frame (the popups, the screen) is converted before it's used as the window's offset or
+-- compared with the window's height.
+local Scale = { MIN = 75, MAX = 200 }
+function Scale.get()
+	local size = tonumber(db.windowSize) or 100 -- (saved data is untrusted)
+	if size ~= size then
+		size = 100 -- (not a number)
+	end
+	return math.max(Scale.MIN, math.min(Scale.MAX, size)) / 100
+end
+-- A length in `frame`'s units, in the window's.
+function Scale.toMain(frame, v)
+	return v * frame:GetEffectiveScale() / main:GetEffectiveScale()
+end
+-- The screen's height in the window's units.
+function Scale.screenHeight()
+	return Scale.toMain(UIParent, UIParent:GetHeight())
+end
+
+-- Roll button sizes. The rows grow by `extra` so the timer bar keeps running under the buttons.
+Scale.LOOK = {
+	-- glow: the hover glow's square (its visible part is smaller).
+	-- 2 px between buttons, the 4 px timer bar 2 px under them; the icon grows with the row to keep 3 px
+	-- above and below.
+	small = { size = 20, step = 22, top = -4, glow = 28, extra = 0 }, -- (v1.2's buttons; icon 28)
+	medium = { size = 25, step = 27, top = -3, glow = 35, extra = 3, icon = 31 }, -- (meets the 24 px guideline)
+	large = { size = 28, step = 30, top = -3, glow = 40, extra = 6, icon = 34 },
+	-- Blizzard's own popup size (32 px buttons, Forever's GroupLootFrame.xml; its icon is a little bigger, 34).
+	xlarge = { size = 32, step = 34, top = -3, glow = 45, extra = 10, icon = 38 },
+}
+Scale.extra = 0
+Scale.iconSize = ICON -- a look with `icon` grows it
+-- The Roll buttons setting's choices, in order.
+Scale.CHOICES = { { "small", "Small" }, { "medium", "Medium" }, { "large", "Large" }, { "xlarge", "Extra large" } }
+function Scale.look()
+	-- Without "Roll from this window" there are no buttons: rows as v1.2's. An unknown saved value: the default.
+	if not History.rollsHere() then
+		return Scale.LOOK.small
+	end
+	return type(db.rollButtons) == "string" and Scale.LOOK[db.rollButtons] or Scale.LOOK[DEFAULTS.rollButtons]
+end
+-- The row height for the current look; true if it changed.
+function Scale.setRows()
+	local look = Scale.look()
+	local extra, icon = look.extra, look.icon or ICON
+	if extra == Scale.extra and icon == Scale.iconSize then
+		return false
+	end
+	Scale.extra, Scale.iconSize = extra, icon
+	HEADER_H = 34 + extra
+	MIN_HEIGHT = TITLE_H + 2 * HEADER_H + CARD_GAP + BOTTOM_PAD
+	History.ROW_H = HEADER_H + CARD_GAP
+	return true
+end
+-- Where the 4 px timer bar sits (Player lines Everyone and None): beside the icon's bottom, under the roll
+-- buttons; with bigger ones, 2 px below them. (Summary's thin timer runs along the row's bottom edge anyway.)
+function Scale.placeTimer(card)
+	card.timer:ClearAllPoints()
+	card.timer:SetPoint("BOTTOMLEFT", card.icon, "BOTTOMRIGHT", 6, Scale.timerY())
+	card.timer:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
+	card.timer:SetHeight(4)
+end
+-- The hover glow and each button's own hover highlight, for every roll button of a drop: lit only on
+-- the button under the mouse, never while the click guard holds the drop, and back as soon as it lets go
+-- with the mouse still there. Run when the guard starts or ends and when the buttons show or hide; OnEnter
+-- and OnLeave handle ordinary hovering.
+function Scale.refreshGlow(card)
+	if not card.buttons then
+		return -- (the bar hides once while it's made, before the drop has it)
+	end
+	local guarded = card.guarded and true or false
+	for _, button in ipairs(card.buttons.list) do
+		local lit = db.hoverGlow and button.glow.ok and not guarded and button:IsEnabled() and button:IsVisible()
+			and button:IsMouseOver() and true or false
+		if button.glow:IsShown() ~= lit then
+			button.glow:SetShown(lit)
+		end
+		if button.dimmedHighlight ~= guarded then
+			button.dimmedHighlight = guarded
+			local highlight = button:GetHighlightTexture()
+			if highlight then
+				highlight:SetAlpha(guarded and 0 or 1)
+			end
+		end
+	end
+end
+
+-- The 4 px timer bar's offset from the icon's bottom: 1 in a 34 px row; in a taller one, 2 px under the
+-- buttons (its bottom `top - size - 6` from the row's top).
+function Scale.timerY()
+	local look = Scale.look()
+	return Scale.extra > 0 and (look.top - look.size - 3 + Scale.iconSize) or 1
+end
+-- Line 2's baseline (the winner, the boss name, the time), from the row's bottom: the icon's bottom + 4.
+function Scale.lineTwo()
+	return 35 + Scale.extra - Scale.iconSize
+end
+
+-- A drop's roll buttons and the parts of its row that depend on the row's height.
+function Scale.styleCard(card)
+	local look, bar = Scale.look(), card.buttons
+	bar:ClearAllPoints()
+	bar:SetPoint("TOPRIGHT", card.frame, "TOPRIGHT", -4, look.top)
+	bar:SetSize((bar.wide and 4 or 3) * look.step, look.size)
+	for _, button in ipairs(bar.list) do
+		button:SetSize(look.size, look.size)
+		button:ClearAllPoints()
+		button:SetPoint("RIGHT", bar, "RIGHT", -button.spec.spot * look.step, 0)
+		button.glow:SetSize(look.glow, look.glow)
+	end
+	card.boss:SetPoint("BOTTOMRIGHT", card.frame, "BOTTOMRIGHT", -6, Scale.lineTwo())
+	-- Your choice takes the right-hand button's place, at its size.
+	card.mineIcon:SetSize(look.size, look.size)
+	History.placeMine(card, look)
+	if card.icon:GetWidth() ~= Scale.iconSize then
+		card.icon:SetSize(Scale.iconSize, Scale.iconSize)
+	end
+	if card.timerThin then
+		card.timer:ClearAllPoints() -- (Summary's thin timer starts under the name, past the icon)
+		card.timer:SetPoint("BOTTOMLEFT", card.frame, "BOTTOMLEFT", Scale.iconSize + 9, 3)
+		card.timer:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
+	else
+		Scale.placeTimer(card)
+	end
+	card.look = look
+	card.headerMode = nil -- (the item level's spot depends on the size: placed again, Scale.restyleRows)
+end
+
+-- By the top-left corner, so a height change grows or shrinks the window downward.
 local function savePosition()
 	local left, top = main:GetLeft(), main:GetTop()
 	if left and top then
@@ -581,7 +825,8 @@ local function popupsOnScreen()
 	local top, x = GroupLootContainer:GetTop(), GroupLootContainer:GetCenter()
 	if top and x then
 		lastPopupSpot = lastPopupSpot or {}
-		lastPopupSpot[1], lastPopupSpot[2] = x, top
+		local es = GroupLootContainer:GetEffectiveScale() -- (kept in screen pixels: the window's size may change)
+		lastPopupSpot[1], lastPopupSpot[2] = x * es, top * es
 		return true
 	end
 	return false
@@ -599,18 +844,18 @@ local function applyPosition()
 	if db.position == "attached" and popupsOnScreen() then
 		main:SetPoint("BOTTOM", GroupLootContainer, "TOP", 0, 8)
 	elseif db.position == "attached" and lastPopupSpot then
-		main:SetPoint("BOTTOM", UIParent, "BOTTOMLEFT", lastPopupSpot[1], lastPopupSpot[2] + 8)
+		local es = main:GetEffectiveScale()
+		main:SetPoint("BOTTOM", UIParent, "BOTTOMLEFT", lastPopupSpot[1] / es, lastPopupSpot[2] / es + 8)
 	elseif db.position == "attached" and bottomContainer() then
 		main:SetPoint("BOTTOM", bottomContainer(), "TOP", 0, 8)
 	elseif db.position == "attached" then
-		main:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, 220)
+		main:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, Scale.toMain(UIParent, 220))
 	elseif db.point then
 		main:SetPoint(db.point[1], UIParent, db.point[2], db.point[3], db.point[4])
 	else
-		-- Free and never dragged (the default, user 2026-11-10): on the right, beside the quest tracker, top a
-		-- little above the middle of the screen, growing downward, so it's out of the way of the action bars
-		-- and of what you're fighting. Placed fresh each time until you drag it.
-		local x = -300
+		-- Free and never dragged: beside the quest tracker, a little above the middle, out of the way
+		-- of the action bars. Placed fresh each time until dragged.
+		local x = Scale.toMain(UIParent, -300) -- (screen units, so a bigger Window size starts in the same spot)
 		pcall(function()
 			local tracker = ObjectiveTrackerFrame
 			if tracker and tracker:IsShown() and tracker:GetLeft() then
@@ -622,36 +867,34 @@ local function applyPosition()
 				end
 			end
 		end)
-		main:SetPoint("TOPRIGHT", UIParent, "RIGHT", x, 120)
+		main:SetPoint("TOPRIGHT", UIParent, "RIGHT", x, Scale.toMain(UIParent, 120))
 	end
 end
 
--- Which end of the list new drops appear at: the side the window grows from (see layout).
--- Where new drops appear: at the top (db.newOrder, internal since the "New drops appear" setting went on
--- 2026-11-10; see docs/rollframes-removed-settings.md).
+-- Where new drops appear (db.newOrder, internal; "top" by default).
 local function newestAtBottom()
 	return db.newOrder == "bottom"
 end
 
--- R32: in the attached spot the window grows upward from just above the roll popups; it may only grow
+-- in the attached spot the window grows upward from just above the roll popups; it may only grow
 -- to the top of the screen, so the game never has to push it down over the popups. Returns the height
 -- available, or nil when the window isn't attached.
 local function roomAbovePopups()
 	if db.position ~= "attached" then
 		return nil
 	end
-	local bottom
+	local bottom -- (the popups' top, in the window's units)
 	if popupsOnScreen() then
-		bottom = GroupLootContainer:GetTop() + 8
+		bottom = Scale.toMain(GroupLootContainer, GroupLootContainer:GetTop())
 	elseif lastPopupSpot then
-		bottom = lastPopupSpot[2] + 8
+		bottom = lastPopupSpot[2] / main:GetEffectiveScale()
 	elseif bottomContainer() then
-		bottom = bottomContainer():GetTop() + 8
+		bottom = Scale.toMain(bottomContainer(), bottomContainer():GetTop())
 	else
-		bottom = 220
+		bottom = Scale.toMain(UIParent, 220)
 	end
 	local top = UIParent:GetTop()
-	return top and (top - bottom - 10) or nil
+	return top and (Scale.toMain(UIParent, top) - bottom - 8 - 10) or nil
 end
 
 local function createMain()
@@ -666,17 +909,28 @@ local function createMain()
 	end
 	main = frame
 	main:SetSize(WIDTH, MIN_HEIGHT)
-	main:SetFrameStrata("HIGH")
+	-- At rest in Blizzard's window layer (MEDIUM, with the character and bag windows), so Options (HIGH) is always in
+	-- front: in HIGH it stayed over Options (the panel template's title bar has frame level 510, which Options'
+	-- click-to-front can't pass). While a drop waits for your roll it goes up to the roll popups' layer
+	-- (History.updateStrata).
+	main:SetFrameStrata("MEDIUM")
+	main:SetToplevel(true)
 	main:SetClampedToScreen(true)
 	main:SetMovable(true)
 	main:EnableMouse(true)
 	main:RegisterForDrag("LeftButton")
-	main:SetScript("OnDragStart", function(self)
-		db.position = "free"
-		self:StartMoving()
-		self.moving = true -- (see the window's OnHide: a drag cut short by the window hiding still ends)
+	main:SetScript("OnMouseDown", function(self)
+		self.pressY = select(2, GetCursorPosition())
+	end)
+	main:SetScript("OnDragStart", function()
+		if History.DRAG_ANYWHERE or History.inTitleBar() then
+			History.startMove()
+		end
 	end)
 	main:SetScript("OnDragStop", Guard.wrapCore("move", function(self)
+		if not self.moving then
+			return -- (a drag that didn't start in the title bar)
+		end
 		self:StopMovingOrSizing()
 		self.moving = nil
 		savePosition()
@@ -692,10 +946,15 @@ local function createMain()
 		local title = main:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 		title:SetPoint("TOP", 0, -8)
 		title:SetText("Loot Rolls")
-		titleText = title -- (History switches it to "Loot History")
+		titleText = title
 	end
-	local close = CreateFrame("Button", nil, main, "UIPanelCloseButton")
-	close:SetPoint("TOPRIGHT", 2, 1)
+	-- Blizzard's own close button for this panel art: its size and corner offsets are the ones Blizzard's windows
+	-- use (a plain one sat past the corner). Older clients without it: the plain one.
+	local okClose, close = pcall(CreateFrame, "Button", nil, main, "UIPanelCloseButtonDefaultAnchors")
+	if not (okClose and close) then
+		close = CreateFrame("Button", nil, main, "UIPanelCloseButton")
+		close:SetPoint("TOPRIGHT", 2, 1)
+	end
 	main.closeButton = close
 
 	-- The pin, left of the close button: lit when the window stays open, dim when it fades when idle.
@@ -724,19 +983,19 @@ local function createMain()
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
 		if pinned then
 			GameTooltip:SetText("Stays open", 1, 1, 1)
-			GameTooltip:AddLine("Stays until you close it. Click to let it fade when loot is done.", nil, nil, nil, true)
+			GameTooltip:AddLine("Click to let it hide when idle.", nil, nil, nil, true)
 		else
-			GameTooltip:SetText("Fades when idle", 1, 1, 1)
-			GameTooltip:AddLine(string.format("Fades %d seconds after the last roll is decided. Click to keep it open.",
+			GameTooltip:SetText("Hides when idle", 1, 1, 1)
+			GameTooltip:AddLine(string.format("Hides after %d seconds idle (never under the mouse). Click to keep it open.",
 				db.autoHide), nil, nil, nil, true)
 		end
-		GameTooltip:AddLine("Idle time: Options > AddOns > RollFrames.", 0.6, 0.6, 0.6, true)
+		GameTooltip:AddLine("Time: Options, Hide when idle after", 0.6, 0.6, 0.6, true)
 		GameTooltip:Show()
 	end)
 	pin:SetScript("OnLeave", GameTooltip_Hide)
 	main.pin = pin
 
-	-- Clear (an X, left of the pin; refreshPin moves it next to the close button when the pin is hidden).
+	-- Clear: an X left of the clock (History.placeClock places both).
 	local clear = CreateFrame("Button", nil, main)
 	clear:SetSize(14, 14)
 	clear:Hide() -- shown with History (the clock), just left of it
@@ -768,23 +1027,23 @@ local function createMain()
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
 		if History.demoActive then
 			GameTooltip:SetText("Stop the demo", 1, 1, 1)
-			GameTooltip:AddLine("Removes the demo's made-up drops. Your own history isn't touched.", nil, nil, nil, true)
+			GameTooltip:AddLine("Removes the made-up drops. Your History isn't touched.", nil, nil, nil, true)
 			GameTooltip:Show()
 			return
 		end
-		GameTooltip:SetText("Clear history", 1, 1, 1)
-		GameTooltip:AddLine("Removes every decided drop from the list and from History. Rolls in progress stay.",
+		GameTooltip:SetText("Clear History", 1, 1, 1)
+		GameTooltip:AddLine("Removes this character's finished drops from the list and History. Asks first.",
 			nil, nil, nil, true)
+		GameTooltip:AddLine("Rolls in progress stay.", 0.6, 0.6, 0.6, true)
 		GameTooltip:Show()
 	end)
 	clear:SetScript("OnLeave", GameTooltip_Hide)
 	main.clear = clear
 
-	-- History (left of the clear X): shows or hides the drops decided earlier, continuing the list.
+	-- History (the clock): shows or hides the drops decided earlier, continuing the list.
 	local hist = CreateFrame("Button", nil, main)
 	hist:SetSize(16, 16)
-	hist:SetPoint("RIGHT", pin, "LEFT", -18, 0) -- (an icon-wide gap from the pin and close; not the top-left corner,
-	-- where the resize grip is when attached)
+	hist:SetPoint("RIGHT", pin, "LEFT", -18, 0) -- (History.placeClock sets its final spot)
 	clear:SetPoint("RIGHT", hist, "LEFT", -4, 0)
 	hist:SetFrameLevel(titleLevel + 5)
 	hist.lit = hist:CreateTexture(nil, "BACKGROUND") -- a gold box behind the clock while History shows
@@ -805,13 +1064,16 @@ local function createMain()
 	end)
 	hist:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
+		GameTooltip:SetText("History", 1, 1, 1)
 		if History.shown then
-			GameTooltip:SetText("Hide older drops", 1, 1, 1)
+			GameTooltip:AddLine("Click to hide the older drops.", nil, nil, nil, true)
 		else
-			GameTooltip:SetText("History", 1, 1, 1)
-			GameTooltip:AddLine("Shows the drops decided earlier (saved for this character), continuing the list. They go again "
-				.. "on their own after a while if you leave the window alone (unless \"Finished drops stay\" is Until cleared).",
-				nil, nil, nil, true)
+			GameTooltip:AddLine("Shows this character's older drops in the list.", nil, nil, nil, true)
+			local fade = tonumber(db.historyFade) or 0
+			if fade > 0 then
+				GameTooltip:AddLine("They leave again after " .. (fade >= 60 and (fade / 60 .. (fade == 60 and " minute" or " minutes"))
+					or (fade .. " seconds")) .. " untouched.", 0.6, 0.6, 0.6, true)
+			end
 		end
 		GameTooltip:Show()
 	end)
@@ -856,25 +1118,27 @@ local function createMain()
 	-- Border and background: see-through a little while the window can fade by itself, solid when pinned or
 	-- while the mouse is over it. Only runs while an unpinned window is visible (refreshPin shows/hides it).
 	local chrome = { main.NineSlice, main.Bg }
-	local chromeAlpha, chromeTarget = 1, 1
+	local chromeTarget = 1
 	local function setChrome(target)
 		if target == chromeTarget then
 			return
 		end
 		chromeTarget = target
-		local from = chromeAlpha
-		tween("main:chrome", 0.25, function(p)
-			chromeAlpha = from + (target - from) * p
-			for _, region in ipairs(chrome) do
-				region:SetAlpha(chromeAlpha)
-			end
-		end)
+		for _, region in ipairs(chrome) do
+			History.fade(region, target, 0.25)
+		end
 	end
 	main.setChrome = setChrome
 	local watch = CreateFrame("Frame", nil, main)
+	-- (10 times a second while the window shows: the chrome of a window that can fade by itself, and the resize
+	-- corner, shown only while the mouse is over the window.)
 	watch:SetScript("OnUpdate", Guard.wrapUpdate("chrome", function()
-		setChrome(main:IsMouseOver() and 1 or CHROME_IDLE_ALPHA)
-	end, 0.1)) -- (10 times a second)
+		local over = main:IsMouseOver()
+		if main.chromeTransient then
+			setChrome(over and 1 or CHROME_IDLE_ALPHA)
+		end
+		History.showGrip(over)
+	end, 0.1))
 	watch:Hide()
 	main.chromeWatch = watch
 	-- (Protected: whatever happens here, the hooks after it still run, among them the one that brings
@@ -907,7 +1171,7 @@ local function createMain()
 	content:SetSize(WIDTH - 2 * SIDE_PAD, 1)
 	scroll:SetScrollChild(content)
 	main.empty = main:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-	main.empty:SetPoint("TOP", scroll, "TOP", 0, -5)
+	main.empty:SetPoint("TOP", scroll, "TOP", 0, -40) -- (spaced down from the title)
 	main.empty:SetText("No loot rolls yet")
 	main.emptyHint = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	main.emptyHint:SetPoint("TOP", main.empty, "BOTTOM", 0, -4)
@@ -915,8 +1179,7 @@ local function createMain()
 	main.emptyHint:SetWordWrap(true)
 	main.emptyHint:SetJustifyH("CENTER")
 	main.emptyHint:SetText("Group loot rolls appear here.")
-	-- A new player can see it work straight away (user, 2026-11-10): the demo plays out in the window, with
-	-- the first-use question above it. Shown only while the list is empty and the demo can run (solo).
+	-- Shown only while the list is empty and the demo can run (solo).
 	main.demoButton = CreateFrame("Button", nil, main, "UIPanelButtonTemplate")
 	main.demoButton:SetSize(120, 22)
 	main.demoButton:SetPoint("TOP", main.emptyHint, "BOTTOM", 0, -10)
@@ -925,24 +1188,47 @@ local function createMain()
 		History.startDemo()
 	end)
 	main.demoButton:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+		History.tooltipBeside(self, self) -- (beside the window: below the button it covered the link under it)
 		GameTooltip:SetText("Try the demo", 1, 1, 1)
-		GameTooltip:AddLine("A few made-up drops play out here, so you can see how it works. Nothing is rolled. "
-			.. "(Also: /rollframes demo)", nil, nil, nil, true)
+		GameTooltip:AddLine("Three made-up drops play out here. Nothing is rolled.", nil, nil, nil, true)
+		GameTooltip:AddLine("Also: /rollframes demo", 0.6, 0.6, 0.6, true)
 		GameTooltip:Show()
 	end)
 	main.demoButton:SetScript("OnLeave", GameTooltip_Hide)
 	main.demoButton:Hide()
+	-- Retires the demo offer for good (saved; /rollframes reset all brings it back).
+	local hide = CreateFrame("Button", nil, main)
+	main.demoHide = hide
+	hide.text = hide:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	hide.text:SetPoint("CENTER")
+	hide.text:SetText("Don't show this again")
+	local textWidth = hide.text:GetStringWidth()
+	hide:SetSize((type(textWidth) == "number" and textWidth > 0 and textWidth or 110) + 12, 18)
+	hide:SetPoint("TOP", main.demoButton, "BOTTOM", 0, -8)
+	hide:SetScript("OnEnter", function(self)
+		self.text:SetTextColor(1, 1, 1)
+		History.tooltipBeside(self, self)
+		GameTooltip:SetText("Don't show this again", 1, 1, 1)
+		GameTooltip:AddLine("Hides this on all your characters.", nil, nil, nil, true)
+		GameTooltip:AddLine("Still runs with: /rollframes demo", 0.6, 0.6, 0.6, true) -- (own line: never split mid-command)
+		GameTooltip:Show()
+	end)
+	hide:SetScript("OnLeave", function(self)
+		self.text:SetTextColor(1, 0.82, 0)
+		GameTooltip_Hide()
+	end)
+	hide:SetScript("OnClick", Guard.wrap("demo", function()
+		History.retireDemoOffer()
+	end))
+	hide:Hide()
 	scroll:EnableMouseWheel(true)
 	scroll:SetScript("OnMouseWheel", function(self, delta)
 		local range = self:GetVerticalScrollRange()
 		self:SetVerticalScroll(math.max(0, math.min(range, self:GetVerticalScroll() - delta * 40)))
 	end)
 
-	-- "More to roll" markers: pinned inside the top and bottom edges of the list while drops that still
-	-- have your roll buttons are scrolled out of view there, with a gentle gold pulse so they're noticed.
-	-- Clicking one scrolls the next waiting drop into view. Their OnUpdate (the pulse) only runs while
-	-- they show.
+	-- "More to roll" markers at the list's edges while drops with your roll buttons are scrolled out of
+	-- view there; a click scrolls to the next one.
 	local function createMarker(up)
 		local m = CreateFrame("Button", nil, main)
 		m.up = up
@@ -980,7 +1266,7 @@ local function createMain()
 		m:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
 		m:SetScript("OnEnter", function(self)
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-			GameTooltip:SetText("Waiting for your roll", 1, 1, 1)
+			GameTooltip:SetText("Drops waiting for your roll", 1, 1, 1)
 			GameTooltip:AddLine("Click to scroll to the next one.", nil, nil, nil, true)
 			GameTooltip:Show()
 		end)
@@ -992,7 +1278,7 @@ local function createMain()
 		m:SetScript("OnUpdate", Guard.wrapUpdate("markers", function(self, elapsed)
 			self.t = ((self.t or 0) + elapsed) % 1.6
 			local level = 0.5 - 0.5 * math.cos(self.t / 1.6 * 2 * math.pi) -- 0 -> 1 -> 0
-			if db.flashing == "off" then
+			if History.noFlash() then
 				level = 0.6 -- Accessibility: steady
 			end
 			self.glow:SetAlpha(0.16 * level)
@@ -1011,10 +1297,37 @@ local function createMain()
 	if ScrollUtil and ScrollUtil.InitScrollFrameWithScrollBar then
 		local ok, bar = pcall(CreateFrame, "EventFrame", nil, main, "MinimalScrollBar")
 		if ok and bar then
-			bar:SetPoint("TOPLEFT", scroll, "TOPRIGHT", 2, 0)
-			bar:SetPoint("BOTTOMLEFT", scroll, "BOTTOMRIGHT", 2, 0)
+			-- In the window's right padding (8 px bar, 10 px padding), so rows keep their width; stops above
+			-- the resize grip.
+			bar:SetPoint("TOPLEFT", scroll, "TOPRIGHT", 1, 0)
+			bar:SetPoint("BOTTOMLEFT", scroll, "BOTTOMRIGHT", 1, 8)
 			if pcall(ScrollUtil.InitScrollFrameWithScrollBar, scroll, bar) then
 				scrollBar = bar
+				bar:Hide() -- (until the list scrolls: layout)
+				bar.wanted = false
+				-- Track and thumb only: the arrows are 17 px wide on the 8 px bar, so they reached
+				-- over the rows and onto the resize grip. The wheel, dragging the thumb and clicking the track scroll.
+				pcall(function()
+					for _, stepper in ipairs({ bar.Back, bar.Forward }) do
+						if stepper then
+							stepper:Hide()
+							stepper:EnableMouse(false)
+							hooksecurefunc(stepper, "Show", stepper.Hide) -- (if the bar ever shows them again)
+						end
+					end
+					if bar.Track then
+						bar.Track:ClearAllPoints()
+						bar.Track:SetPoint("TOP")
+						bar.Track:SetPoint("BOTTOM")
+						-- It's thin: the grab zone reaches 3 px left (still 2 px clear of the roll buttons). The
+						-- thumb lights up when the mouse is in it, so what you see matches what you can grab.
+						bar.Track:SetHitRectInsets(-3, 0, 0, 0)
+						if bar.Track.Thumb then
+							bar.Track.Thumb:SetHitRectInsets(-3, 0, 0, 0)
+						end
+					end
+					bar:SetFrameLevel(content:GetFrameLevel() + 5) -- (above the rows' edge it reaches over)
+				end)
 			else
 				bar:Hide()
 			end
@@ -1029,34 +1342,66 @@ local function createMain()
 		end
 	end)
 
-	-- Resize grip: drag to set how tall the window may grow. Bottom-right when free; top-left when attached
-	-- above the loot roll popups, so it grows away from them.
+	-- Resize grip: bottom-right when free; top-left when attached, so it grows away from the popups.
 	grip = CreateFrame("Button", nil, main)
 	grip:SetSize(16, 16)
 	grip:SetFrameLevel((main.TitleContainer and main.TitleContainer:GetFrameLevel() or main:GetFrameLevel()) + 5)
 	grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
 	grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
 	grip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+	-- While dragging, the corner moves with the mouse, which slips on and off it: its hover (tooltip, outline)
+	-- would flicker, so it's held until the mouse is let go, the highlight locked on.
 	grip:SetScript("OnEnter", function(self)
+		if self:GetScript("OnUpdate") then
+			return
+		end
 		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText("Drag to set the window's height", 1, 1, 1)
-		GameTooltip:AddLine("Longer lists scroll. /rollframes reset puts it back.", nil, nil, nil, true)
+		GameTooltip:SetText("Drag to resize", 1, 1, 1)
+		GameTooltip:AddLine(db.autoGrow and "Sets how tall it can grow (the outline); then it scrolls."
+			or "Sets the window's height; longer lists scroll.", nil, nil, nil, true)
+		if db.snapDrag then
+			GameTooltip:AddLine("Moves a whole row at a time.", nil, nil, nil, true)
+		end
+		GameTooltip:AddLine("/rollframes reset: default size and spot", 0.6, 0.6, 0.6, true)
 		GameTooltip:Show()
 	end)
-	grip:SetScript("OnLeave", GameTooltip_Hide)
+	grip:SetScript("OnLeave", function(self)
+		if self:GetScript("OnUpdate") then
+			return
+		end
+		GameTooltip_Hide()
+		History.showLimit(false, 0)
+	end)
+	grip:HookScript("OnEnter", function(self)
+		if not self:GetScript("OnUpdate") then
+			History.showLimit(true)
+		end
+	end)
 	grip:SetScript("OnMouseDown", function(self)
+		if Guard.off.resize then
+			return -- (switched off after an error: no drag that can't run)
+		end
+		GameTooltip_Hide()
+		self:LockHighlight()
 		local _, cursorY = GetCursorPosition()
 		self.startY, self.startHeight = cursorY, main:GetHeight()
+		if db.autoGrow and main.growLimit and main.growLimit > self.startHeight then
+			-- Growing with its drops: the drag starts from the limit, not the shorter current window, which opens
+			-- to the limit while you drag.
+			self.startHeight = main.growLimit
+			main:SetHeight(self.startHeight)
+		end
+		History.showLimit(true)
 		self:SetScript("OnUpdate", Guard.wrapUpdate("resize", function()
 			local _, y = GetCursorPosition()
 			local delta = (y - self.startY) / main:GetEffectiveScale()
 			if db.position ~= "attached" then
 				delta = -delta -- the grip is at the bottom: dragging down makes it taller
 			end
-			local maxAllowed = math.max(MIN_HEIGHT, math.min(UIParent:GetHeight() - 40, roomAbovePopups() or math.huge))
+			local maxAllowed = math.max(MIN_HEIGHT, math.min(Scale.screenHeight() - 40, roomAbovePopups() or math.huge))
 			local key = db.autoGrow and "maxHeight" or "height" -- the limit when growing; else the fixed height
 			local h = math.max(MIN_HEIGHT, math.min(maxAllowed, self.startHeight + delta))
-			if db.snapRows then -- (jumps a row at a time, at each halfway point: what you see is what you get)
+			if db.snapDrag then -- "Snap to whole rows": a row at a time, at each halfway point
 				h = History.snapHeight(h)
 				if h > maxAllowed then
 					h = History.snapHeight(maxAllowed, true)
@@ -1067,11 +1412,23 @@ local function createMain()
 			end
 			db[key] = math.floor(h)
 			main:SetHeight(db[key])
+			if main.limit and main.limit:IsShown() then
+				main.limit:SetHeight(db[key]) -- (the outline follows the drag)
+			end
 		end))
 	end)
 	grip:SetScript("OnMouseUp", function(self)
+		local dragged = self:GetScript("OnUpdate") ~= nil
 		self:SetScript("OnUpdate", nil)
+		self:UnlockHighlight()
+		if dragged and self:IsMouseOver() then
+			self:GetScript("OnEnter")(self) -- (its hover was held during the drag)
+		end
 		layout() -- shrinks back to the drops if they need less than the new limit
+		if main.limit and main.limit:IsShown() then
+			main.limit:SetHeight(main.growLimit or main:GetHeight()) -- (the limit stays outlined; the window shrinks)
+		end
+		History.showLimit(false, 0.6) -- (lingers a moment; stays while the mouse is still on the corner)
 	end)
 
 	-- Catch up on any relayout that waited while the window was hidden, before its first visible frame.
@@ -1084,7 +1441,25 @@ local function createMain()
 		layout()
 	end))
 
+	main:SetScale(Scale.get())
 	applyPosition()
+end
+
+-- Sets the window to the Window size setting. A dragged window keeps its top-left corner where it is
+-- on screen: its saved offsets are in the window's own units, so they're converted to the new size.
+-- Attached and never-dragged windows are placed fresh by applyPosition.
+function Scale.apply()
+	local new, old = Scale.get(), main:GetScale()
+	if math.abs(new - old) < 0.001 then
+		return
+	end
+	local p = db.point
+	if db.position ~= "attached" and type(p) == "table" and tonumber(p[3]) and tonumber(p[4]) then
+		db.point = { p[1], p[2], p[3] * old / new, p[4] * old / new }
+	end
+	main:SetScale(new)
+	applyPosition()
+	layout() -- (also re-places the first-use question and the grip)
 end
 
 local function placeGrip()
@@ -1126,14 +1501,16 @@ end
 -- with until the setting itself changes.
 local function currentLinesMode()
 	local mode = db.playerLines
-	if mode == "auto" or (mode ~= "all" and mode ~= "summary" and mode ~= "none") then
+	if mode == "auto" then
 		return IsInRaid() and "summary" or "all"
+	elseif mode ~= "all" and mode ~= "summary" and mode ~= "none" then
+		return "summary" -- (damaged or unknown saved value)
 	end
 	return mode
 end
 
 -- A card's height while its roll is open. It's set by how many players can roll, not by how many have
--- chosen, so it doesn't change as people roll (R31). "reserved" is the most players listed so far, or
+-- chosen, so it doesn't change as people roll. "reserved" is the most players listed so far, or
 -- the group size when the roll starts before the loot history lists anyone.
 local function expandedHeight(card)
 	local mode = card.linesMode
@@ -1150,14 +1527,14 @@ local function targetHeight(card)
 	return card.collapsed and HEADER_H or expandedHeight(card)
 end
 
--- Animate the card's height to where its content needs it.
 local function resize(card, instant)
 	local to = targetHeight(card)
 	if card.height == to then
-		return -- unchanged: no relayout needed
+		return
 	end
 	local from = card.height or to
 	if instant or from == to then
+		tweens[card.id .. ":height"] = nil -- (one still running would finish at its old target: Scale.restyleRows)
 		card.height = to
 		card.frame:SetHeight(to)
 		relayoutPending = true
@@ -1174,7 +1551,7 @@ end
 -- Only the top-left point moves; the right edge is anchored once when the line joins a card.
 local function placeLine(card, line, i)
 	line.index = i
-	line:SetPoint("TOPLEFT", card.frame, "TOPLEFT", ICON + 12 + (line.slide or 0), -(HEADER_H + (i - 1) * LINE_H))
+	line:SetPoint("TOPLEFT", card.frame, "TOPLEFT", Scale.iconSize + 12 + (line.slide or 0), -(HEADER_H + (i - 1) * LINE_H))
 end
 
 -- First position of a group's lines in the card (groups are contiguous, in GROUP_ order).
@@ -1225,21 +1602,20 @@ local function lineGroup(entry)
 	return GROUP_ROLLED
 end
 
--- The summary line ("Player lines: Summary") sits right under the item row.
 local function placeSummary(card)
 	if card.summaryPlaced then
 		return
 	end
 	card.summaryPlaced = true
 	-- On the item row's second line (where the winner goes once it's decided), with the roll's timer as a
-	-- thin line along the bottom edge under it (user, 2026-11-10: one compact height in Summary).
+	-- thin line along the bottom edge under it, so a Summary row keeps one compact height.
 	card.waiting:ClearAllPoints()
 	card.waiting:SetPoint("BOTTOMLEFT", card.icon, "BOTTOMRIGHT", 6, 4) -- (line 2's column and baseline; the thin timer is below)
 	card.waiting:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
 	if not card.timerThin then
 		card.timerThin = true -- (kept across reuse; resetCard puts the normal timer back)
 		card.timer:ClearAllPoints()
-		card.timer:SetPoint("BOTTOMLEFT", card.frame, "BOTTOMLEFT", ICON + 9, 3) -- (above the highlight's 2 px border)
+		card.timer:SetPoint("BOTTOMLEFT", card.frame, "BOTTOMLEFT", Scale.iconSize + 9, 3) -- (above the highlight's 2 px border)
 		card.timer:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
 		card.timer:SetHeight(2)
 	end
@@ -1251,7 +1627,8 @@ local function createLine(card)
 	line:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
 	line.bg = line:CreateTexture(nil, "BACKGROUND")
 	line.bg:SetAllPoints()
-	line.bg:SetColorTexture(1, 0.82, 0.2, 0)
+	line.bg:SetColorTexture(1, 0.82, 0.2, 0.28) -- (the winner's gold; shown by its alpha, so it can fade natively)
+	line.bg:SetAlpha(0)
 	-- Your own roll: a faint blue tint and an accent bar, separate from the gold winner highlight.
 	line.selfBg = line:CreateTexture(nil, "BACKGROUND", nil, 1)
 	line.selfBg:SetAllPoints()
@@ -1342,36 +1719,629 @@ local function updateLineText(card, line, entry)
 	elseif entry.roll then
 		line.roll:SetText(entry.roll)
 	else
-		line.roll:SetText("|cff888888...|r")
+		-- Chosen, no number yet; once the roll is over, a choice that never got one shows "-", not "..." (still
+		-- waiting): a Greed when someone needed (only the Need choices roll), or a number the game kept hidden.
+		line.roll:SetText(done and "|cff888888-|r" or "|cff888888...|r")
+	end
+end
+
+-- A soft band crossing `parent`, `times` times (0.7 s each). Kept inside the parent: frames don't clip,
+-- so a band starting left of the row drew over the window's edge and flickered.
+function History.sweepBand(key, band, parent, width, times)
+	local W = 60
+	local shownWidth -- (only set again when it changes: at the two ends; mid-row it's 60 throughout)
+	local function place(p)
+		local x = -W + (width + W) * p
+		local left, right = math.max(0, x), math.min(width, x + W)
+		if right - left < 1 then
+			if band:IsShown() then
+				band:Hide()
+			end
+			return
+		end
+		band:SetPoint("LEFT", parent, "LEFT", left, 0) -- (its only point: one call a frame)
+		local w = math.floor(right - left) -- (down: never past the row's edge)
+		if w ~= shownWidth then
+			shownWidth = w
+			band:SetWidth(w)
+		end
+		if not band:IsShown() then
+			band:Show()
+		end
+	end
+	local function run(n)
+		band:ClearAllPoints()
+		band:SetHeight(parent:GetHeight() > 0 and parent:GetHeight() or HEADER_H)
+		shownWidth = nil
+		place(0)
+		tween(key, 0.7, function(p)
+			place(p)
+			band:SetAlpha(1 - p * 0.3)
+		end, function()
+			band:Hide()
+			if n > 1 then
+				run(n - 1)
+			end
+		end, true)
+	end
+	run(times)
+end
+
+-- Native sweep: an AnimationGroup moves the band, so nothing runs per frame. It slides inside a frame
+-- that clips to its target, so it can start and end outside it. Sweep frames are pooled (borrowed
+-- for 0.7 s), not one per row or line. Clients without it use History.sweepBand.
+History.sweepPool = {}
+function History.takeSweep()
+	local sweep = table.remove(History.sweepPool)
+	if sweep or History.noNativeSweep then
+		return sweep
+	end
+	local ok, made = pcall(function()
+		local clip = CreateFrame("Frame", nil, main)
+		clip:SetClipsChildren(true)
+		local mover = CreateFrame("Frame", nil, clip)
+		local band = mover:CreateTexture(nil, "OVERLAY")
+		band:SetAllPoints()
+		band:SetTexture("Interface\\Buttons\\WHITE8X8")
+		band:SetBlendMode("ADD")
+		local group = mover:CreateAnimationGroup()
+		local move = group:CreateAnimation("Translation")
+		move:SetDuration(0.7)
+		local fade = group:CreateAnimation("Alpha")
+		fade:SetFromAlpha(1)
+		fade:SetToAlpha(0.7)
+		fade:SetDuration(0.7)
+		local sweep = { clip = clip, mover = mover, band = band, group = group, move = move }
+		local function done()
+			History.giveBackSweep(sweep)
+		end
+		group:SetScript("OnFinished", done)
+		group:SetScript("OnStop", done)
+		return sweep
+	end)
+	if not ok then
+		History.noNativeSweep = true -- (this client can't: the Lua sweep from now on)
+		return nil
+	end
+	return made
+end
+
+function History.giveBackSweep(sweep)
+	if not sweep.target then
+		return -- (already back)
+	end
+	if sweep.target.rfSweep == sweep then
+		sweep.target.rfSweep = nil
+	end
+	sweep.target = nil
+	sweep.mover:Hide()
+	sweep.clip:Hide()
+	History.sweepPool[#History.sweepPool + 1] = sweep
+end
+
+-- One sweep across `target` (a row or a player line), in the given colour: native where it can, else the Lua
+-- band `fallback`, coloured here.
+function History.playSweep(key, target, fallback, width, r, g, b, a)
+	History.stopSweep(target)
+	if not (main and main:IsVisible()) then
+		return -- (nobody can see it: a closed window, or the UI hidden)
+	end
+	local sweep = History.takeSweep()
+	if not sweep then
+		if not pcall(fallback.SetGradient, fallback, "HORIZONTAL", CreateColor(r, g, b, 0), CreateColor(r, g, b, a)) then
+			fallback:SetColorTexture(r, g, b, a * 0.6)
+		end
+		History.sweepBand(key, fallback, target, width, 1)
+		return
+	end
+	sweep.target, target.rfSweep = target, sweep
+	sweep.clip:SetParent(target)
+	sweep.clip:ClearAllPoints()
+	sweep.clip:SetAllPoints(target)
+	if not pcall(sweep.band.SetGradient, sweep.band, "HORIZONTAL", CreateColor(r, g, b, 0), CreateColor(r, g, b, a)) then
+		sweep.band:SetColorTexture(r, g, b, a * 0.6)
+	end
+	sweep.mover:ClearAllPoints()
+	sweep.mover:SetPoint("TOPRIGHT", target, "TOPLEFT") -- (starts just left of it, clipped out of sight)
+	sweep.mover:SetPoint("BOTTOMRIGHT", target, "BOTTOMLEFT")
+	sweep.mover:SetWidth(60)
+	sweep.move:SetOffset(width + 60, 0)
+	sweep.clip:Show()
+	sweep.mover:Show()
+	sweep.group:Play()
+end
+
+function History.stopSweep(target)
+	local sweep = target.rfSweep
+	if sweep then
+		sweep.group:Stop()
+		History.giveBackSweep(sweep) -- (in case Stop fired nothing: it wasn't playing yet)
+	end
+end
+
+-- A 100: the action-button proc glow (Blizzard's flipbooks, played by the engine) on the choice icon: the
+-- burst, three turns of the loop, the last fading. Pooled like the sweep. Flashing Off: the still glow
+-- Blizzard uses when it tones proc glows down, for the same time.
+History.GLOW_LOOPS = 3
+History.glowPool = {}
+function History.takeGlow()
+	local glow = table.remove(History.glowPool)
+	if glow or History.noGlow then
+		return glow
+	end
+	local ok, made = pcall(function()
+		local f = CreateFrame("Frame", nil, main)
+		local burst = f:CreateTexture(nil, "OVERLAY")
+		burst:SetAtlas("UI-HUD-ActionBar-Proc-Start-Flipbook")
+		burst:SetPoint("CENTER")
+		burst:SetAlpha(0)
+		local loop = f:CreateTexture(nil, "OVERLAY")
+		loop:SetAtlas("UI-HUD-ActionBar-Proc-Loop-Flipbook")
+		loop:SetAllPoints()
+		loop:SetAlpha(0)
+		local still = f:CreateTexture(nil, "OVERLAY")
+		still:SetAtlas("UI-HUD-RotationHelper-ProcAltGlow")
+		still:SetPoint("CENTER")
+		local group = f:CreateAnimationGroup()
+		group:SetToFinalAlpha(true)
+		local function alpha(tex, order, from, to, duration)
+			local a = group:CreateAnimation("Alpha")
+			a:SetTarget(tex)
+			a:SetOrder(order)
+			a:SetFromAlpha(from)
+			a:SetToAlpha(to)
+			a:SetDuration(duration or 0.001)
+		end
+		local function flip(tex, order, duration)
+			local a = group:CreateAnimation("FlipBook")
+			a:SetTarget(tex)
+			a:SetOrder(order)
+			a:SetDuration(duration)
+			a:SetFlipBookRows(6)
+			a:SetFlipBookColumns(5)
+			a:SetFlipBookFrames(30)
+			a:SetFlipBookFrameWidth(0)
+			a:SetFlipBookFrameHeight(0)
+		end
+		-- (Blizzard's timing: a 0.7 s burst, then a 1 s loop.)
+		alpha(burst, 1, 1, 1)
+		flip(burst, 2, 0.7)
+		alpha(burst, 3, 1, 0)
+		alpha(loop, 3, 1, 1)
+		for i = 1, History.GLOW_LOOPS do
+			flip(loop, 3 + i, 1)
+		end
+		alpha(loop, 3 + History.GLOW_LOOPS, 1, 0, 1)
+		local glow = { frame = f, burst = burst, loop = loop, still = still, group = group }
+		local function done()
+			History.giveBackGlow(glow)
+		end
+		group:SetScript("OnFinished", done)
+		group:SetScript("OnStop", done)
+		return glow
+	end)
+	if not ok then
+		History.noGlow = true -- (this client can't: no glow from now on)
+		return nil
+	end
+	return made
+end
+
+function History.giveBackGlow(glow)
+	if not glow.target then
+		return -- (already back)
+	end
+	if glow.target.rfGlow == glow then
+		glow.target.rfGlow = nil
+	end
+	glow.target = nil
+	glow.frame:Hide()
+	History.glowPool[#History.glowPool + 1] = glow
+end
+
+function History.stopGlow(icon)
+	local glow = icon.rfGlow
+	if glow then
+		glow.group:Stop()
+		History.giveBackGlow(glow)
+	end
+end
+
+function History.playGlow(icon)
+	History.stopGlow(icon)
+	if not (main and main:IsVisible() and icon:IsShown()) then
+		return
+	end
+	local glow = History.takeGlow()
+	if not glow then
+		return
+	end
+	glow.token = (glow.token or 0) + 1 -- (a still glow's timer ends only its own play)
+	glow.target, icon.rfGlow = icon, glow
+	local s = icon:GetWidth() > 0 and icon:GetWidth() or 14
+	local f = glow.frame
+	f:SetParent(icon:GetParent())
+	f:SetFrameLevel(icon:GetParent():GetFrameLevel() + 5)
+	f:ClearAllPoints()
+	f:SetPoint("CENTER", icon)
+	f:SetSize(s * 1.4, s * 1.4) -- (Blizzard's sizes, for a 45 px button: this frame 1.4x, the burst 150 px)
+	glow.burst:SetSize(s * 150 / 45, s * 150 / 45)
+	f:Show()
+	if History.noFlash() then
+		glow.burst:SetAlpha(0)
+		glow.loop:SetAlpha(0)
+		local info = C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo("UI-HUD-RotationHelper-ProcAltGlow")
+		if info and info.width then
+			glow.still:SetSize(info.width * s / 45, info.height * s / 45)
+		else
+			glow.still:SetSize(s * 1.6, s * 1.6)
+		end
+		glow.still:Show()
+		local token = glow.token
+		C_Timer.After(0.7 + History.GLOW_LOOPS, function()
+			if glow.target == icon and glow.token == token then
+				History.giveBackGlow(glow)
+			end
+		end)
+		return
+	end
+	glow.still:Hide()
+	glow.group:Play()
+end
+
+-- Every 100 the drop shows when its roll ends: on the player lines (Detailed), else the winner's.
+function History.glowHundreds(card)
+	if card.instant then
+		return -- (decided before a reload: not new)
+	end
+	if card.linesMode == "all" then
+		for _, line in pairs(card.lines) do
+			local e = line.entry
+			if e and tonumber(e.roll) == 100 and e.state ~= STATE.PASS then
+				History.playGlow(line.icon)
+			end
+		end
+	elseif card.winner and tonumber(card.winner.roll) == 100 then
+		History.playGlow(card.winnerIcon)
 	end
 end
 
 local function playWinnerSweep(card, line)
 	line.check:Show()
-	if db.flashing == "off" then -- Accessibility: highlighted at once, no sweep
-		line.bg:SetColorTexture(1, 0.82, 0.2, 0.28)
+	if History.noFlash() or not db.resultSweep then -- highlighted at once, no sweep
+		History.setAlpha(line.bg, 1)
 		return
 	end
-	tween(card.id .. ":winbg", 0.4, function(p)
-		line.bg:SetColorTexture(1, 0.82, 0.2, 0.28 * p)
+	-- The line's gold comes in once the sweep has crossed it, not during.
+	History.setAlpha(line.bg, 0)
+	local gen = card.gen
+	C_Timer.After(0.7, function()
+		if card.gen == gen and line.entry and card.winnerKey and card.lines[card.winnerKey] == line then
+			History.fade(line.bg, 1, 0.3)
+		end
 	end)
-	local width = line:GetWidth() > 0 and line:GetWidth() or (WIDTH - ICON - 40)
-	local function sweep(times)
-		line.shine:Show()
-		tween(card.id .. ":shine", 0.7, function(p)
-			line.shine:SetPoint("LEFT", line, "LEFT", -60 + (width + 60) * p, 0) -- (its only point)
-			line.shine:SetAlpha(1 - p * 0.3)
-		end, function()
-			line.shine:Hide()
-			if times > 1 then
-				sweep(times - 1)
-			end
-		end, true)
-	end
-	sweep(2)
+	local width = line:GetWidth() > 0 and line:GetWidth() or (WIDTH - Scale.iconSize - 40)
+	History.playSweep(card.id .. ":shine", line, line.shine, width, 1, 0.85, 0.4, 0.7) -- (one pass)
 end
 
--- True when the user keeps only better items in the history and this one's quality is known to be lower.
+-- MEDIUM normally (Options, in HIGH, stays in front). While a drop waits for your roll, DIALOG,
+-- the roll popups' layer, so nothing ordinary covers it.
+function History.updateStrata()
+	if not main then
+		return
+	end
+	local waiting = false
+	if History.rollsHere() and not Guard.fallback then
+		for _, card in ipairs(cards) do
+			if card.buttons and card.buttons:IsShown() and card.frame:IsShown() and not card.dismissing then
+				waiting = true
+				break
+			end
+		end
+	end
+	local want = waiting and "DIALOG" or "MEDIUM"
+	if main.strataNow ~= want then
+		main.strataNow = want
+		main:SetFrameStrata(want)
+		if waiting then
+			main:Raise()
+		end
+	end
+end
+
+-- The empty window's text block: the two lines, and the demo offer under them when it shows.
+function History.emptyBlockH()
+	local offer = not db.demoHidden and History.canDemo()
+	return offer and 88 or 30 -- (14 + 4 + 12, then 10 + 22 + 8 + 18 for the button and the link)
+end
+
+-- With "Grow with drops", the height the window may grow to is a promise of screen space,
+-- but the window is usually shorter. While the corner is dragged or hovered, a faint outline shows that height;
+-- after a drag the window shrinks to its drops and the outline lingers a moment, then fades.
+function History.showLimit(on, hold)
+	if not (main and grip) then
+		return
+	end
+	local dragging = grip:GetScript("OnUpdate") ~= nil
+	if on and db.autoGrow then
+		local o = main.limit
+		if not o then
+			o = CreateFrame("Frame", nil, main)
+			o:SetFrameLevel(math.max(0, main:GetFrameLevel() - 1))
+			o:EnableMouse(false)
+			o.fill = o:CreateTexture(nil, "BACKGROUND")
+			o.fill:SetAllPoints()
+			o.fill:SetColorTexture(1, 1, 1, 0.04)
+			for _, side in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
+				{ "TOPLEFT", "BOTTOMLEFT", false }, { "TOPRIGHT", "BOTTOMRIGHT", false } }) do
+				local e = o:CreateTexture(nil, "BORDER")
+				e:SetPoint(side[1])
+				e:SetPoint(side[2])
+				if side[3] then e:SetHeight(1) else e:SetWidth(1) end
+				e:SetColorTexture(1, 1, 1, 0.45)
+			end
+			main.limit = o
+		end
+		o:ClearAllPoints()
+		if anchorFactor == 1 then -- (grows upward)
+			o:SetPoint("BOTTOMLEFT", main, "BOTTOMLEFT")
+			o:SetPoint("BOTTOMRIGHT", main, "BOTTOMRIGHT")
+		else
+			o:SetPoint("TOPLEFT", main, "TOPLEFT")
+			o:SetPoint("TOPRIGHT", main, "TOPRIGHT")
+		end
+		o:SetHeight(dragging and main:GetHeight() or main.growLimit or main:GetHeight())
+		History.limitGen = (History.limitGen or 0) + 1
+		History.setAlpha(o, 1)
+		o:Show()
+		return
+	end
+	local o = main.limit
+	if not (o and o:IsShown()) or dragging or (grip:IsMouseOver() and db.autoGrow) then
+		return
+	end
+	History.limitGen = (History.limitGen or 0) + 1
+	local gen = History.limitGen
+	local function fade()
+		if gen ~= History.limitGen then
+			return -- (shown again meanwhile)
+		end
+		History.fade(o, 0, 0.3, function()
+			o:Hide()
+		end)
+	end
+	if (hold or 0) > 0 then
+		C_Timer.After(hold, fade)
+	else
+		fade()
+	end
+end
+
+-- The resize corner shows while the mouse is over the window (or a drag is on), fading in and out.
+function History.showGrip(over)
+	if not grip then
+		return
+	end
+	local want = (over or grip:GetScript("OnUpdate") ~= nil) and 1 or 0
+	if History.gripWant == want then
+		return
+	end
+	History.gripWant = want
+	History.fade(grip, want, 0.2)
+end
+
+-- The clock (History) sits over the Need column (the leftmost roll button) at every Roll buttons size, so the
+-- title bar lines up with the drops below; without roll buttons, over Medium's. Placed from the
+-- close button (Blizzard's, at its own corner offsets), so it shares the title bar's middle line.
+function History.placeClock()
+	local hist, close = main and main.hist, main and main.closeButton
+	if not (hist and close) then
+		return
+	end
+	local look = History.rollsHere() and Scale.look() or Scale.LOOK.medium
+	local needCenter = SIDE_PAD + 4 + 2 * look.step + look.size / 2 -- (from the window's right edge)
+	local _, _, _, closeX = close:GetPoint(1)
+	local closeW = close:GetWidth()
+	if type(closeW) ~= "number" or closeW <= 0 or closeW > 40 then
+		closeW = 24
+	end
+	local closeLeft = (tonumber(closeX) or 0) - closeW -- (its left edge, from the window's right edge)
+	-- The clear X hugs the clock's left (it belongs to History and shows only with it). With big roll buttons
+	-- that reaches the title, so the clock moves over Greed, the X still beside it.
+	local titleW = main.titleText and main.titleText.GetStringWidth and main.titleText:GetStringWidth()
+	if type(titleW) ~= "number" or titleW <= 0 then
+		titleW = 60
+	end
+	local titleRight = (WIDTH - 30 - 24) / 2 + 24 - titleW / 2 -- (the title's right end, from the window's right edge)
+	local clockCenter = needCenter
+	if needCenter + 8 + 4 + 14 + 4 > titleRight then
+		clockCenter = SIDE_PAD + 4 + look.step + look.size / 2 -- Greed
+	end
+	hist:ClearAllPoints()
+	hist:SetPoint("RIGHT", close, "LEFT", (8 - clockCenter) - closeLeft, 0) -- (16 px: its right edge 8 past the centre)
+	local clear = main.clear
+	if clear then
+		clear:ClearAllPoints()
+		clear:SetPoint("RIGHT", hist, "LEFT", -4, 0)
+	end
+end
+
+-- The Summary counts line: one text per choice in a fixed column (Need, Greed, Pass, then rare
+-- Transmog), so a column always holds the same choice. SetText("") clears it, like the old single text.
+History.COUNT_COLUMN = 30 -- px per column: a 12 px icon, a space and up to two digits (a raid's 40)
+History.COUNT_STATES = { STATE.NEED, STATE.GREED, STATE.PASS, STATE.TRANSMOG }
+function History.countsLine(parent)
+	local line = CreateFrame("Frame", nil, parent)
+	line:SetHeight(12)
+	line.slots = {}
+	for i, state in ipairs(History.COUNT_STATES) do
+		local slot = line:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+		slot:SetPoint("BOTTOMLEFT", line, "BOTTOMLEFT", (i - 1) * History.COUNT_COLUMN, 0)
+		slot:SetJustifyH("LEFT")
+		slot:SetWordWrap(false)
+		slot.shownText = "" -- (starts blank)
+		slot.icon = "|A:" .. STATE_ATLAS[state] .. ":12:12:0:0:153:153:153|a "
+		line.slots[i] = slot
+	end
+	line.dots = line:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall") -- ("..." before anyone has chosen)
+	line.dots:SetPoint("BOTTOMLEFT")
+	local function put(slot, n) -- (only a changed count is written)
+		local text = n > 0 and (slot.icon .. n) or ""
+		if slot.shownText ~= text then
+			slot.shownText = text
+			slot:SetText(text)
+		end
+	end
+	function line:SetCounts(need, greed, pass, transmog)
+		put(self.slots[1], need)
+		put(self.slots[2], greed)
+		put(self.slots[3], pass)
+		put(self.slots[4], transmog)
+		local dots = (need + greed + pass + transmog) > 0 and "" or "..."
+		if self.dots.shownText ~= dots then
+			self.dots.shownText = dots
+			self.dots:SetText(dots)
+		end
+	end
+	function line:SetText(text) -- (only ever "": clear; pieces already blank are left alone)
+		for _, slot in ipairs(self.slots) do
+			if slot.shownText ~= "" then
+				slot.shownText = ""
+				slot:SetText("")
+			end
+		end
+		text = text or ""
+		if self.dots.shownText ~= text then
+			self.dots.shownText = text
+			self.dots:SetText(text)
+		end
+	end
+	return line
+end
+
+-- Your wins keep a faint gold tint once they're compact rows, and in History:
+-- WIN_TINT while the result shows, KEPT_TINT after. One colour for both, here.
+History.WIN_COLOR = { 1, 0.82, 0.2 }
+History.WIN_TINT, History.KEPT_TINT = 0.18, 0.10
+function History.setTint(texture, alpha)
+	local c = History.WIN_COLOR
+	History.setAlpha(texture, 1)
+	texture:SetColorTexture(c[1], c[2], c[3], alpha)
+	texture.rfLevel = alpha
+end
+
+-- The tint's level is its colour's alpha times its own. A change fades its own alpha (natively), with the
+-- colour at the higher of the two levels.
+function History.tintLevel(texture)
+	return texture:IsShown() and (texture.rfLevel or 0) * History.shownAlpha(texture) or 0
+end
+
+function History.fadeTint(texture, to, duration, done)
+	local from = History.tintLevel(texture)
+	local top = math.max(from, to)
+	if top <= 0 then
+		History.setTint(texture, 0)
+		if done then done() end
+		return
+	end
+	History.setTint(texture, top)
+	History.fade(texture, to / top, duration, done, from / top)
+end
+
+-- Result sweep across a row without player lines: gold plus a lasting tint for your win, grey for
+-- someone else's. Flashing Off or sweeps off: no motion (your win still gets the tint).
+function History.playRowSweep(card, lost)
+	local f = card.frame
+	if not card.winTint then -- (made the first time this card shows a result sweep; kept for reuse)
+		card.winTint = f:CreateTexture(nil, "BACKGROUND", nil, 1)
+		card.winTint:SetAllPoints()
+		card.rowShine = f:CreateTexture(nil, "OVERLAY")
+		card.rowShine:SetTexture("Interface\\Buttons\\WHITE8X8")
+		card.rowShine:SetBlendMode("ADD")
+		if not pcall(card.rowShine.SetGradient, card.rowShine, "HORIZONTAL",
+			CreateColor(1, 0.85, 0.4, 0), CreateColor(1, 0.85, 0.4, 0.7)) then
+			card.rowShine:SetColorTexture(1, 0.85, 0.4, 0.4)
+		end
+	end
+	if card.rowShine:IsShown() then
+		card.rowShine:Hide()
+	end
+	-- Someone else won: a grey band, no tint. Yours: gold, and the tint. (The band's colour is set by
+	-- History.playSweep, only if this client needs the Lua band.)
+	local shade = lost and 0.75 or nil
+	-- No motion: Flashing Off, sweeps turned off, or nobody can see it (a closed window: the end state at once).
+	local still = History.noFlash() or not db.resultSweep or not (main and main:IsVisible())
+	if lost then
+		card.winTint:Hide()
+		if still then
+			return -- (the row already says who won)
+		end
+	else
+		card.winTint:Show()
+		if still then
+			History.setTint(card.winTint, History.WIN_TINT)
+			return
+		end
+		-- The tint comes in once the sweep has crossed the row, not during.
+		History.setTint(card.winTint, 0)
+		local gen = card.gen
+		C_Timer.After(0.7, function()
+			if card.gen == gen and not card.collapsed and card.winTint:IsShown() then
+				History.fadeTint(card.winTint, History.WIN_TINT, 0.3)
+			end
+		end)
+	end
+	local width = f:GetWidth() > 0 and f:GetWidth() or (WIDTH - 2 * SIDE_PAD)
+	History.playSweep(card.id .. ":rowshine", f, card.rowShine, width, shade or 1, shade or 0.85, shade or 0.4,
+		lost and 0.45 or 0.7)
+end
+
+-- A drop you won becoming a compact row: its tint settles to the kept one (fading), made here if the drop
+-- never swept (Everyone, sweeps off, or decided before a reload).
+function History.keepWinTint(card)
+	History.stopSweep(card.frame)
+	if not card.winTint then
+		card.winTint = card.frame:CreateTexture(nil, "BACKGROUND", nil, 1)
+		card.winTint:SetAllPoints()
+		card.rowShine = card.frame:CreateTexture(nil, "OVERLAY")
+		card.rowShine:SetTexture("Interface\\Buttons\\WHITE8X8")
+		card.rowShine:SetBlendMode("ADD")
+		card.rowShine:Hide()
+	end
+	if card.instant then
+		card.winTint:Show()
+		History.setTint(card.winTint, History.KEPT_TINT)
+		return
+	end
+	History.fadeTint(card.winTint, History.KEPT_TINT, 0.35) -- (from where it is: hidden counts as none)
+	card.winTint:Show()
+end
+
+-- The win tint and sweep off. When the row collapses the tint fades out like the window's other fades;
+-- a card going back to the pool clears at once.
+function History.clearRowSweep(card, fade)
+	History.stopSweep(card.frame)
+	if not card.winTint then
+		return
+	end
+	tweens[card.id .. ":rowshine"] = nil
+	if card.rowShine:IsShown() then
+		card.rowShine:Hide()
+	end
+	if not card.winTint:IsShown() then
+		return -- (no tint to clear: most drops; a tint is set again before it shows)
+	end
+	if fade and History.tintLevel(card.winTint) > 0 then
+		History.fadeTint(card.winTint, 0, 0.35, function()
+			card.winTint:Hide()
+		end)
+	else
+		card.winTint:Hide()
+		History.setTint(card.winTint, 0)
+	end
+end
+
+-- True when the player keeps only better items in the history and this one's quality is known to be lower.
 local function belowHistoryQuality(card, quality)
 	quality = quality or card.quality
 	local min = db.historyMinQuality or 0
@@ -1387,7 +2357,7 @@ local function leaveHistoryReason(card)
 	end
 end
 
--- The card under the cursor while it shows your roll buttons (R31). It holds still: whatever else
+-- The card under the cursor while it shows your roll buttons. It holds still: whatever else
 -- happens in the list (new drops, other drops collapsing, old rows leaving the history), layout keeps it
 -- at the same spot on screen, using the scroll and, when that isn't enough, an empty gap above or below
 -- the list that closes once you click, move the mouse off it, or its roll ends. Nothing waits, and the
@@ -1398,7 +2368,7 @@ local function heldCard()
 		return nil -- (the default: new drops come in at the top; the button guard covers the clicks)
 	end
 	-- Only inside the visible list: a card can reach past the window's edge, hidden by the scroll area.
-	if not (db.rollFromWindow and main and main:IsVisible() and scroll:IsMouseOver()) then
+	if not (History.rollsHere() and main and main:IsVisible() and scroll:IsMouseOver()) then
 		return nil
 	end
 	if (main.markerUp:IsShown() and main.markerUp:IsMouseOver())
@@ -1434,40 +2404,173 @@ local function waitForRelease()
 			self:Hide()
 			relayoutPending = true
 			driver:Show()
-		end, 0.1)) -- (10 times a second)
+		end, 0.1))
 	end
 	holdWatch:Show()
+end
+
+-- The winner line in two columns: the roll left-aligned in a fixed box right after the icon, the name after it, so names line up
+-- down the list whatever the numbers. text is the combined "<roll>  <name>" kept in History records; without a
+-- roll ("All passed", "Winner unknown") the text starts where the roll box does.
+History.ROLL_W, History.ROLL_W3 = 13, 18 -- two-digit and "100" boxes, until measured (History.rollWidth)
+-- Boxes measured in the game's font: the column fits "100", numbers right-aligned in it.
+function History.rollWidth(fs)
+	if not History.rollMeasured then
+		local ok, two, three = pcall(function()
+			fs:SetText("99")
+			local a = fs:GetStringWidth()
+			fs:SetText("100")
+			local b = fs:GetStringWidth()
+			fs:SetText("")
+			return a, b
+		end)
+		if ok and type(two) == "number" and two > 0 and type(three) == "number" and three > 0 then
+			History.ROLL_W, History.ROLL_W3 = math.ceil(two) + 1, math.ceil(three) + 1
+			History.rollMeasured = true
+		end
+	end
+	return History.ROLL_W
+end
+History.ROLL_COLUMN = false -- roll and name as one text; true: the roll in its own column (dev: /rollframes columns)
+-- Your choice's icon takes the right-hand button's spot; "…" and then your roll sit centred in the column
+-- left of it (the Greed button's), so they line up down the list whatever their width.
+function History.placeMine(card, look)
+	look = look or card.look or Scale.look()
+	if card.mineStep == look.step and card.mineTop == look.top then
+		return -- (unchanged: your roll updates often)
+	end
+	card.mineStep, card.mineTop = look.step, look.top
+	card.mineIcon:ClearAllPoints()
+	card.mineIcon:SetPoint("TOPRIGHT", card.frame, "TOPRIGHT", -4, look.top)
+	card.mineRoll:ClearAllPoints()
+	card.mineRoll:SetPoint("CENTER", card.frame, "TOPRIGHT", -4 - look.step - look.size / 2, look.top - look.size / 2)
+end
+
+-- The roll ended: your choice and roll fade out with the result sweep (gone as it finishes), or in 0.3 s
+-- without one. The item level moves to the row's edge only after, so it never slides over them.
+function History.fadeMine(card)
+	if not card.mineIcon:IsShown() or card.instant or not main:IsVisible() then
+		card.mineIcon:Hide()
+		card.mineRoll:Hide()
+		placeHeader(card)
+		return
+	end
+	if card.mineState ~= STATE.PASS and card.mineRollShown == nil then
+		card.mineRoll:SetText("|cff888888-|r") -- (a choice that never got a number, as on its player line)
+	end
+	local sweeps = card.winner and db.resultSweep and not History.noFlash()
+	local gen = card.gen
+	local function gone() -- (their alphas are set back when they show again: setMine)
+		if card.gen == gen and card.finished then
+			card.mineIcon:Hide()
+			card.mineRoll:Hide()
+			placeHeader(card)
+		end
+	end
+	local duration = sweeps and 0.7 or 0.3
+	History.fade(card.mineIcon, 0, duration, gone, 0.35) -- (from their resting alphas: no reads)
+	History.fade(card.mineRoll, 0, duration, nil, 1)
+end
+
+-- The window moves only from its title bar, so a near miss of the resize corner (or any edge) doesn't drag
+-- it away. DRAG_ANYWHERE: the whole window, for a frameless style.
+History.DRAG_ANYWHERE = false
+function History.inTitleBar()
+	local top = main:GetTop()
+	local y = main.pressY -- (where the press was: the drag starts a few pixels later)
+	if not y then
+		y = select(2, GetCursorPosition())
+	end
+	if not (top and y) then
+		return true
+	end
+	return y / main:GetEffectiveScale() >= top - TITLE_H
+end
+
+function History.startMove()
+	db.position = "free"
+	main:StartMoving()
+	main.moving = true -- (see the window's OnHide: a drag cut short by the window hiding still ends)
+end
+
+-- Shift-click links, Ctrl-click previews. In combat the game won't open a window for an addon ("Interface
+-- action failed"), so a click that would have to open the dressing room does nothing; one already open
+-- still takes the item.
+function History.itemClick(link)
+	if InCombatLockdown() and not IsModifiedClick("CHATLINK")
+		and not (IsModifiedClick("DRESSUP") and DressUpFrame and DressUpFrame:IsShown()) then
+		return
+	end
+	HandleModifiedItemClick(link)
+end
+
+function History.setWinnerLine(rollFS, nameFS, anchor, text)
+	local icon = rollFS.choiceIcon
+	if icon and icon.inColumn ~= History.ROLL_COLUMN then
+		-- (beside the text it precedes: an empty roll text has no height, so beside it the icon sits low)
+		icon.inColumn = History.ROLL_COLUMN
+		icon:ClearAllPoints()
+		if History.ROLL_COLUMN then
+			icon:SetPoint("RIGHT", rollFS, "LEFT", -2, 0)
+		else
+			icon:SetPoint("RIGHT", nameFS, "LEFT", -4, 0)
+		end
+	end
+	if nameFS.lineText == text then
+		return -- (unchanged: updates come often)
+	end
+	nameFS.lineText = text
+	if not History.ROLL_COLUMN then
+		if rollFS.hasText then -- (only after the column layout was tried: dev builds)
+			rollFS.hasText = nil
+			rollFS:SetText("")
+		end
+		nameFS:SetText(text or "")
+		if not nameFS.plainPlaced then
+			nameFS.plainPlaced = true
+			nameFS:SetPoint("BOTTOMLEFT", anchor, "BOTTOMRIGHT", 24, 4)
+		end
+		return
+	end
+	nameFS.plainPlaced = nil
+	local roll, name = (text or ""):match("^|cffffd100(%d+)|r  (.*)$")
+	local box = History.ROLL_W3 -- (room for "100"; the numbers sit right-aligned in it, so their last digits line up)
+	rollFS:SetWidth(box)
+	rollFS:SetText(roll or "")
+	rollFS.hasText = roll ~= nil
+	nameFS:SetText(name or text or "")
+	nameFS:SetPoint("BOTTOMLEFT", anchor, "BOTTOMRIGHT", roll and (22 + box + 3) or 22, 4)
 end
 
 -- Fills the item row's bottom line with the winner (or "All passed").
 local function updateHeaderWinner(card)
 	if card.rollEnded and not card.winner and not card.allPassed then
-		card.winnerText:SetText("|cff888888Roll ended|r")
+		card.winnerFull = "|cff888888Winner unknown|r"
 		card.winnerIcon:Hide()
 	elseif card.allPassed then
-		card.winnerText:SetText("|cffff5555All passed|r")
+		card.winnerFull = "|cffff5555All passed|r"
 		card.winnerIcon:SetAtlas(STATE_ATLAS[STATE.PASS]) -- (an icon like a winner's, so the text lines up)
 		card.winnerIcon:Show()
 	elseif card.winner then
 		local w = card.winner
-		card.winnerText:SetText((w.roll and ("|cffffd100" .. w.roll .. "|r  ") or "") .. classColored(w.name, w.class))
+		card.winnerFull = (w.roll and ("|cffffd100" .. w.roll .. "|r  ") or "") .. classColored(w.name, w.class)
+			.. (w.isSelf and " |A:common-icon-checkmark:12:12|a" or "") -- (yours: not by colour alone)
 		card.winnerIcon:SetAtlas(STATE_ATLAS[w.state] or STATE_ATLAS[STATE.GREED])
 		card.winnerIcon:Show()
 	end
+	History.setWinnerLine(card.winnerRoll, card.winnerText, card.icon, card.winnerFull)
 end
 
 -- Fades the winner in on the item row (from wherever it is, so a winner already showing doesn't flicker).
-local function showHeaderWinner(card, key)
+local function showHeaderWinner(card)
 	updateHeaderWinner(card)
-	local from = card.winnerText:GetAlpha()
-	if from >= 1 and not tweens[card.id .. ":winner"] then
-		return -- already showing (Summary and None show it before the collapse): no fade from 1 to 1
+	if card.winnerText:GetAlpha() >= 1 then
+		return -- showing, or fading in (Summary and None show it before the collapse)
 	end
-	tween(card.id .. (key or ":winner"), 0.35, function(p)
-		local a = from + (1 - from) * p
-		card.winnerText:SetAlpha(a)
-		card.winnerIcon:SetAlpha(a)
-	end)
+	local from = History.shownAlpha(card.winnerText)
+	History.fade(card.winnerText, 1, 0.35, nil, from)
+	History.fade(card.winnerRoll, 1, 0.35, nil, from)
+	History.fade(card.winnerIcon, 1, 0.35, nil, from)
 end
 
 -- Frame pools (see "Frame reuse" below); declared here so a collapsing drop can give its lines back.
@@ -1479,11 +2582,14 @@ local function releaseLines(card)
 	local prefix = card.id .. ":"
 	for key in pairs(tweens) do
 		if key:sub(1, #prefix) == prefix and (key:sub(-3) == ":in" or key == prefix .. "winbg"
-			or key == prefix .. "shine") then
+			or key == prefix .. "shine" or key == prefix .. "linesout") then
 			tweens[key] = nil
 		end
 	end
 	for _, line in pairs(card.lines) do
+		History.stopGlow(line.icon)
+		History.stopFade(line)
+		History.stopFade(line.bg)
 		line:Hide()
 		line:ClearAllPoints()
 		line.entry = nil -- (the pool keeps frames, not the old drop's data)
@@ -1511,17 +2617,21 @@ collapse = function(card)
 		return
 	end
 	card.collapsed = true
-	local keepSummary = card.linesMode == "summary" -- (stays, with hover for everyone's rolls; see targetHeight)
-	if not keepSummary then
-		card.lastRolls = nil -- history rows don't show the roll list
+	if card.winner and card.winner.isSelf then
+		History.keepWinTint(card) -- (yours: a faint tint stays)
+	else
+		History.clearRowSweep(card, true)
 	end
+	local keepSummary = card.linesMode == "summary" -- (its counts line stays, see targetHeight)
+	-- (lastRolls stays in every mode: hovering a finished drop lists its rolls)
 	trimPending = true
+	driver:Show() -- (the trim runs there, even with the window hidden)
 	card.timer:Hide()
 	card.buttons:Hide()
 	card.mineIcon:Hide()
 	card.mineRoll:Hide()
 	placeHeader(card)
-	showHeaderWinner(card, ":collapse-winner")
+	showHeaderWinner(card)
 	if card.bossName then
 		card.boss:SetText(card.bossName)
 		History.fitBoss(card.boss, card.winnerText, 0)
@@ -1531,21 +2641,38 @@ collapse = function(card)
 	card.collapsedAt = GetTime()
 	Guard.call("history", History.record, card)
 	if keepSummary then
-		card.waiting:SetAlpha(0) -- (once, not every frame of the fade)
+		History.setAlpha(card.waiting, 0)
+	else
+		History.fade(card.waiting, 0, 0.35)
 	end
-	tween(card.id .. ":collapse", 0.35, function(p)
-		for _, line in pairs(card.lines) do
-			line:SetAlpha(1 - p)
+	-- A late player still sliding in: settle it, or its slide-in and the fade-out would both set its alpha.
+	local prefix = card.id .. ":"
+	for key in pairs(tweens) do
+		if key:sub(1, #prefix) == prefix and key:sub(-3) == ":in" then
+			tweens[key] = nil
 		end
-		if not keepSummary then
-			card.waiting:SetAlpha(1 - p)
+	end
+	for _, line in pairs(card.lines) do
+		if line.slide and line.slide ~= 0 then
+			line.slide = 0
+			placeLine(card, line, line.index)
 		end
-	end, function()
-		releaseLines(card) -- (a compact row keeps no player lines: up to 40 frames each in a raid)
-		if not keepSummary then
-			card.waiting:Hide()
+	end
+	History.fadeLinesOut(card)
+	local gen = card.gen
+	local function done()
+		if card.gen == gen and card.collapsed then
+			releaseLines(card) -- (a compact row keeps no player lines: up to 40 frames each in a raid)
+			if not keepSummary then
+				card.waiting:Hide()
+			end
 		end
-	end)
+	end
+	if Guard.off.animations or db.noMotion or not main:IsVisible() then
+		done() -- (nothing to see: the lines go back to the pool now)
+	else
+		C_Timer.After(0.35, done)
+	end
 	resize(card)
 end
 
@@ -1556,6 +2683,9 @@ local function finish(card)
 		return
 	end
 	card.finished = true
+	if card.demo then
+		History.checkDemoDone() -- (the last made-up drop decided: the demo leaves a little later)
+	end
 	if not card.demo and not card.instant then -- (a drop replayed already decided, e.g. after /reload, isn't new loot)
 		Ask.lootAt = GetTime() -- (the first-use question never shows right after loot)
 	end
@@ -1563,29 +2693,29 @@ local function finish(card)
 	card.timer:Hide()
 	card.buttons:Hide()
 	if card.linesMode == "all" then
+		History.fadeMine(card) -- (as in the other views: gone with the result sweep)
 		if card.winnerKey and card.lines[card.winnerKey] then
 			playWinnerSweep(card, card.lines[card.winnerKey])
 		end
-		for _, line in pairs(card.lines) do -- anyone who never chose: "..." becomes "no roll"
-			if line.entry and line.entry.state == STATE.NOROLL then
+		for _, line in pairs(card.lines) do -- "..." becomes "no roll" (never chose) or "-" (chose, no number)
+			if line.entry and line.entry.state ~= STATE.PASS and not line.entry.roll then
 				updateLineText(card, line, line.entry)
 			end
 		end
 	else
 		-- No player lines to highlight: the winner shows on the item row straight away. (Summary: in the
 		-- counts' place on the second line; they stay, unseen, for the hover.)
-		card.mineIcon:Hide()
-		card.mineRoll:Hide()
-		placeHeader(card)
+		History.fadeMine(card)
 		showHeaderWinner(card)
 		refreshSummary(card)
+		if card.winner and not card.instant then
+			History.playRowSweep(card, not card.winner.isSelf) -- (gold for your win, grey for someone else's)
+		end
 		if card.linesMode == "summary" then
-			local from = card.waiting:GetAlpha()
-			tween(card.id .. ":summary-out", 0.25, function(p)
-				card.waiting:SetAlpha(from * (1 - p))
-			end)
+			History.fade(card.waiting, 0, 0.25)
 		end
 	end
+	History.glowHundreds(card)
 	if card.instant then
 		collapse(card)
 		return
@@ -1599,7 +2729,7 @@ local function finish(card)
 end
 
 ----------------------------------------------------------------------------------------------------
--- Twins (R38): two or more copies of one item whose rolls start at the same moment. The game can't say
+-- Twins: two or more copies of one item whose rolls start at the same moment. The game can't say
 -- which copy's loot-history entry belongs to which roll (the links are identical, and an entry only
 -- appears with its first roll), so the copies' rolls form a pool: a click on any copy uses one of your
 -- open rolls for that item, and your choice shows on whichever copy the loot history reports it. A copy
@@ -1672,7 +2802,7 @@ end
 -- that copy's shown choice clears, and it offers buttons again if a roll is left.
 local function twinReported(card)
 	if not card.clickedState then
-		-- The click to move: the copy whose pending choice matches the report, else any pending one.
+		-- Prefer the copy whose pending choice matches the report, else any pending one.
 		local moved
 		for pass = 1, 2 do
 			for _, member in ipairs(card.twins.members) do
@@ -1691,9 +2821,8 @@ local function twinReported(card)
 	refreshTwins(card.twins)
 end
 
--- Bind-on-pickup: the game asks you to confirm a roll (CONFIRM_LOOT_ROLL). If its popup closes without
--- a confirm, no roll was made: the roll goes back (to the card's buttons, or the twins pool) and the
--- choice shown for it clears. A confirmed roll stays taken however long its report takes.
+-- Bind-on-pickup rolls need a confirm (CONFIRM_LOOT_ROLL). If its popup closes without one, no roll was
+-- made: the roll goes back to the buttons or twins pool. A confirmed roll stays taken until reported.
 local awaitingConfirm = {} -- roll ID -> true while its confirmation is open (false: not seen open yet)
 local confirmedRolls = {} -- roll ID -> true once confirmed (an auto-confirm addon may do it before we hear of it)
 local confirmWatch
@@ -1720,7 +2849,7 @@ local function onConfirmLootRoll(rollID)
 		return -- can't tell when it closes; Blizzard's popups come back if the window is closed
 	end
 	if confirmedRolls[rollID] then
-		return -- already confirmed (e.g. by an addon that auto-confirms loot warnings)
+		return
 	end
 	awaitingConfirm[rollID] = false
 	if not confirmWatch then
@@ -1728,7 +2857,7 @@ local function onConfirmLootRoll(rollID)
 		confirmWatch:SetScript("OnUpdate", Guard.wrapCoreUpdate("confirm", function(self) -- only while a confirmation is open
 			if StaticPopup_Visible("CONFIRM_LOOT_ROLL") then
 				for id in pairs(awaitingConfirm) do
-					awaitingConfirm[id] = true -- seen open
+					awaitingConfirm[id] = true
 				end
 				return
 			end
@@ -1736,10 +2865,10 @@ local function onConfirmLootRoll(rollID)
 			for id, seen in pairs(awaitingConfirm) do
 				awaitingConfirm[id] = nil
 				if seen and not confirmedRolls[id] then
-					releaseRoll(id) -- seen open, closed without a confirm
+					releaseRoll(id)
 				end
 			end
-		end, 0.25)) -- (4 times a second)
+		end, 0.25))
 	end
 	confirmWatch:Show()
 end
@@ -1747,10 +2876,10 @@ end
 local function cardRollTypes(card)
 	local rollID = card.rollID
 	if not rollID and card.twins then
-		local open = twinOpenRoll(card.twins, nil) -- (its own roll ended: the roll a click would use)
+		local open = twinOpenRoll(card.twins, nil) -- own roll ended: the one a click would use
 		rollID = type(open) == "number" and open or nil
 	end
-	-- (One table, filled again on each call: read at once by refreshButtons, never kept.)
+	-- Shared scratch table, refilled each call: callers must not keep it.
 	local can = ROLL_BUTTONS.can
 	if not rollID or card.demo then
 		can.canNeed, can.canGreed, can.canTransmog = true, true, false
@@ -1767,69 +2896,95 @@ end
 
 local function createButtons(card)
 	local bar = CreateFrame("Frame", nil, card.frame)
-	bar:SetSize(3 * 22, 20) -- (4 * 22 on a roll that allows Transmog)
-	bar:SetPoint("TOPRIGHT", card.frame, "TOPRIGHT", -4, -4)
+	local look = Scale.look() -- restyled later by Scale.styleCard
+	bar:SetSize(3 * look.step, look.size) -- (4 steps on a roll that allows Transmog)
+	bar:SetPoint("TOPRIGHT", card.frame, "TOPRIGHT", -4, look.top)
 	bar.list = {}
 	bar:SetScript("OnShow", function()
-		bar.shownAt = GetTime() -- (see the buttons' OnClick: a press from before this doesn't count)
+		bar.shownAt = GetTime() -- OnClick ignores presses from before this
+		Scale.refreshGlow(card) -- (a reused drop: its last guard's dimmed highlight back)
+		History.updateStrata()
 		requestMarkers()
 	end)
-	bar:SetScript("OnHide", requestMarkers)
-	-- The buttons themselves are made the first time this drop offers them (refreshButtons). With "Roll from
-	-- this window" off, the default, they never are: 4 buttons and 12 textures less for every drop.
+	bar:SetScript("OnHide", function()
+		local hovered = History.hoverButton
+		if hovered and hovered:GetParent() == bar then -- (only this drop's: another's may be under the mouse)
+			History.hoverButton = nil
+			History.hideButtonTip()
+		end
+		Scale.refreshGlow(card) -- (hidden: unlit, so a reused drop's buttons come back unlit)
+		History.updateStrata()
+		requestMarkers()
+	end)
+	-- Built lazily by refreshButtons: with "Roll from this window" off (the default) they never are.
 	function bar.build()
 		bar.build = nil
 		for _, spec in ipairs(ROLL_BUTTONS) do
 			local button = CreateFrame("Button", nil, bar)
-			button:SetSize(20, 20)
-			button:SetPoint("RIGHT", bar, "RIGHT", -spec.spot * 22, 0)
+			local look = Scale.look() -- the card may have been restyled since the bar was made
+			button:SetSize(look.size, look.size)
+			button:SetPoint("RIGHT", bar, "RIGHT", -spec.spot * look.step, 0)
 			button:SetNormalAtlas(spec.atlas .. "-up")
 			button:SetHighlightAtlas(spec.atlas .. "-highlight")
 			button:SetPushedAtlas(spec.atlas .. "-down")
 			button.spec = spec
+			-- Hover glow (accessibility): shows which button a click will hit. Not on a disabled or guarded one.
+			button.glow = button:CreateTexture(nil, "BACKGROUND")
+			button.glow:SetPoint("CENTER")
+			button.glow:SetSize(look.glow, look.glow)
+			button.glow:SetBlendMode("ADD")
+			button.glow:SetVertexColor(1, 0.8, 0.2, 0.9)
+			button.glow.ok = button.glow:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight") ~= false
+			button.glow:Hide()
 			if button.SetMotionScriptsWhileDisabled then
 				button:SetMotionScriptsWhileDisabled(true) -- (a greyed-out button still says why)
 			end
-			-- The drop's tooltip stays (beside the window), with the button's own line at the end.
+			-- Two tooltips: the drop's item tooltip stays (as over the rest of the drop, unless it's on the icon
+			-- only), and a small tip by the button says which roll it is, why not, or the guard.
 			button:SetScript("OnEnter", function(self)
-				card.showTooltip(self, function(b)
-					GameTooltip:AddLine(" ")
-					GameTooltip:AddLine("Click: " .. spec.label, 1, 0.82, 0)
-					if not b:IsEnabled() then
-						GameTooltip:AddLine("Not available for this item.", 0.8, 0.8, 0.8)
-					elseif card.guarded then
-						GameTooltip:AddLine((tonumber(db.guardTime) or 2) > 0
-							and "The list just moved: these work again in a moment (or move the mouse)."
-							or "The list just moved: move the mouse to use these.", 1, 0.82, 0.2, true)
+				-- also rerun by History.refreshButtonTip when the guard changes under a still mouse
+				self.glow:SetShown(db.hoverGlow and self.glow.ok and self:IsEnabled() and not card.guarded or false)
+				History.hoverButton = self
+				if db.itemTooltip ~= "icon" then
+					card.showTooltip(self)
+					if not db.buttonTips and card.guarded and self:IsEnabled() then -- (no tip: the item tooltip says it)
+						GameTooltip:AddLine(History.guardLine(), 1, 0.82, 0.2, true)
+						GameTooltip:Show()
 					end
-				end)
+				end
+				History.showButtonTip(self, card, spec)
 			end)
-			button:SetScript("OnLeave", GameTooltip_Hide)
+			button:SetScript("OnLeave", function(self)
+				self.glow:Hide()
+				if History.hoverButton == self then
+					History.hoverButton = nil
+				end
+				GameTooltip_Hide()
+				History.hideButtonTip()
+			end)
 			button:SetScript("OnMouseDown", function(self)
 				self.pressedAt = GetTime()
 			end)
 			button:SetScript("OnClick", Guard.wrapCore("click", function(self)
 				if not self:IsEnabled() then
-					return -- greyed out: not available for this item
+					return
 				end
 				if card.guarded then
-					-- the list just moved these under a still cursor: a moment, or move the mouse (History.checkGuard).
-					-- A short "denied" sound says the click was heard (user, 2026-11-10; more options later).
+					-- Moved under a still cursor (History.checkGuard); a "denied" sound says the click was heard.
 					if PlaySound then
 						pcall(PlaySound, SOUNDKIT and SOUNDKIT.UI_GARRISON_ARCHITECT_TABLE_BUILDING_PLACEMENT_ERROR or 47355)
 					end
 					return
 				end
-				-- Only a press that began after these buttons appeared counts: a click already in progress when
-				-- they popped up under the cursor (a new drop, or a demo drop replaced by real loot) wasn't
-				-- meant for this item. No delay otherwise. (Keyboard clicks have no press time and count.)
+				-- Only a press that began after the buttons appeared counts: one already in progress when they
+				-- popped up under the cursor wasn't meant for this item. Keyboard clicks have no press time and count.
 				local pressedAt = self.pressedAt
-				self.pressedAt = nil -- each press counts once
+				self.pressedAt = nil
 				if pressedAt and bar.shownAt and pressedAt <= bar.shownAt then
 					return
 				end
 				local roll = ownRoll(card)
-				if card.twins then -- any open roll for this item (twins, R38)
+				if card.twins then -- any open roll for this item
 					roll = twinOpenRoll(card.twins, roll)
 					if roll == nil then
 						bar:Hide()
@@ -1848,12 +3003,8 @@ local function createButtons(card)
 				-- buttons back or hide the choice shown below.
 				card.youRolled = true
 				card.clickedState = CLICK_STATE[spec.type]
-				-- If no roll follows (a bind-on-pickup confirmation cancelled), onConfirmLootRoll gives it back.
-				if card.linesMode ~= "all" then
-					card.setMine(CLICK_STATE[spec.type]) -- your choice shows at once, where the buttons were
-				else
-					placeHeader(card)
-				end
+				-- A cancelled bind-on-pickup confirm gives it back (releaseRoll).
+				card.setMine(CLICK_STATE[spec.type])
 				if card.twins then
 					refreshTwins(card.twins) -- the other copies lose their buttons if no roll is left
 				end
@@ -1865,48 +3016,50 @@ local function createButtons(card)
 	return bar
 end
 
--- Title row: item name, then the item level at the right, left of the roll buttons or your own choice
--- ("Player lines" Summary or None) when they show.
+-- Item level sits left of the roll buttons or your choice when shown, else at the right edge.
 placeHeader = function(card)
 	local mode = card.buttons and card.buttons:IsShown() and "buttons"
 		or (card.mineIcon and card.mineIcon:IsShown() and "mine") or "plain"
 	if card.headerMode == mode then
-		return -- already placed for this layout
+		return
 	end
 	card.headerMode = mode
 	card.ilvl:ClearAllPoints()
 	if mode == "buttons" then
 		card.ilvl:SetPoint("TOPRIGHT", card.buttons, "TOPLEFT", -4, -1)
 	elseif mode == "mine" then
-		card.ilvl:SetPoint("TOPRIGHT", card.mineRoll, "TOPLEFT", -4, 2) -- (left of your roll number, on line 1)
+		-- Where it was beside the buttons (they're hidden, still in place), so it doesn't move when you roll.
+		card.ilvl:SetPoint("TOPRIGHT", card.buttons, "TOPLEFT", -4, -1)
 	else
 		card.ilvl:SetPoint("TOPRIGHT", card.frame, "TOPRIGHT", -6, -5)
 	end
 end
 
--- Highlight for drops waiting for your roll. It shows exactly while a drop's roll buttons show (so only
--- with "Roll from this window") and goes when you roll or the roll ends. One driver animates every
--- highlighted drop; it's a child of the window, so it stops when the window hides, and it hides itself
--- when no drop is highlighted. Game textures only; a piece whose texture doesn't load stays hidden.
-local Highlight = { cards = {}, count = 0, t = 0, STYLES = { "border", "timer", "sparkle", "all", "off" } }
+-- Highlight for drops waiting for your roll: shown exactly while their roll buttons are. One driver
+-- animates them all; a child of the window, so it stops when the window hides. A piece whose texture
+-- doesn't load stays hidden.
+local Highlight = { cards = {}, count = 0, STYLES = { "border", "timer", "sparkle", "all", "off" } }
 Highlight.SPARKS = 5 -- stars per drop in the sparkle style
 
--- Each style's pieces are built the first time a card shows that style (cards are reused, so a few times a
--- session). Border and timer pieces sit in their own small frame, so one SetAlpha pulses all of them.
+-- Pieces are built the first time a card shows a style. Border and timer pieces sit in their own frame,
+-- so one SetAlpha pulses them.
 function Highlight.build(card, style)
 	local hl = card.hl
 	if not hl then
 		hl = CreateFrame("Frame", nil, card.frame)
 		hl:SetAllPoints()
-		-- At the card's own level: above its text, under its roll buttons (a level up), so the gold wash never
-		-- tints the buttons (2026-11-10: it made them look faded). No mouse input.
+		-- At the card's own level, under its roll buttons: the gold wash made them look faded.
 		hl:SetFrameLevel(card.frame:GetFrameLevel())
 		hl:EnableMouse(false)
 		hl.isHighlight = true -- (tests find it by this)
+		hl:SetScript("OnShow", function() -- (the window shown again: start its animations again)
+			if hl.wanted and not hl.styling then
+				Highlight.style(card, hl.wanted)
+			end
+		end)
 		card.hl = hl
 	end
 	if (style == "border" or style == "all") and not hl.border then
-		-- A 2 px gold frame around the drop and a faint gold wash over it.
 		hl.border = CreateFrame("Frame", nil, hl)
 		hl.border:SetAllPoints()
 		for _, side in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
@@ -1924,7 +3077,7 @@ function Highlight.build(card, style)
 		wash:SetBlendMode("ADD")
 	end
 	if (style == "timer" or style == "all") and not hl.bar then
-		-- A gold glow over the roll's timer bar and a spark at its moving edge (placed by the timer's OnUpdate).
+		-- The spark is placed by the timer's OnUpdate.
 		hl.bar = CreateFrame("Frame", nil, card.timer)
 		hl.bar:SetPoint("TOPLEFT", -2, 3)
 		hl.bar:SetPoint("BOTTOMRIGHT", 2, -3)
@@ -1941,7 +3094,6 @@ function Highlight.build(card, style)
 		end
 	end
 	if (style == "sparkle" or style == "all") and not hl.stars then
-		-- Small stars that twinkle in turn at spots along the drop's edge.
 		hl.stars = {}
 		for i = 1, Highlight.SPARKS do
 			local star = hl:CreateTexture(nil, "OVERLAY")
@@ -1951,36 +3103,128 @@ function Highlight.build(card, style)
 			star:SetVertexColor(1, 0.9, 0.5)
 			star:SetAlpha(0)
 			star.phase = (i - 1) / Highlight.SPARKS
-			star.cycle = -1
 			hl.stars[i] = star
 		end
 	end
 end
 
--- Shows the parts of the chosen style and hides the rest.
 function Highlight.style(card, style)
-	local steady = db.flashing == "off" -- Accessibility: nothing twinkles; Sparkles becomes a steady border
+	local steady = History.noFlash() -- Accessibility: nothing twinkles; Sparkles becomes a steady border
 	if steady and style == "sparkle" then
 		style = "border"
 	end
 	Highlight.build(card, style)
 	local hl = card.hl
+	hl.styling = true
 	local border, timer, sparkle = style == "border" or style == "all", style == "timer" or style == "all",
 		(style == "sparkle" or style == "all") and not steady
-	if hl.border then hl.border:SetShown(border) end
+	if hl.border then
+		hl.border:SetShown(border)
+		Highlight.breathe(hl.border, border, steady, 0.35)
+	end
 	if hl.bar then
 		hl.bar:SetShown(timer)
+		Highlight.breathe(hl.bar, timer, steady, 0.3)
 		if hl.spark and hl.sparkOk ~= false then hl.spark:SetShown(not steady) end -- (Off: a steady glow, no moving spark)
 	end
 	if hl.stars then
 		for _, star in ipairs(hl.stars) do
 			star:SetShown(sparkle and star.ok)
-			star:SetAlpha(0)
-			star.cycle = -1
+			Highlight.twinkle(card, star, sparkle and star.ok)
 		end
 	end
 	hl.style = style
 	hl:Show()
+	hl.styling = nil
+end
+
+-- The pulse and the twinkles are animations the engine plays: nothing runs per frame. Each starts at the
+-- clock's phase (Play's offset), so drops waiting together breathe together.
+Highlight.BREATH, Highlight.TWINKLE = 1.2, 1.4 -- seconds: one pulse; one star's twinkle
+
+function Highlight.loop(region, steps, onLoop)
+	local ok, group = pcall(function()
+		local g = region:CreateAnimationGroup()
+		g:SetLooping("REPEAT")
+		for order, step in ipairs(steps) do
+			local a = g:CreateAnimation("Alpha")
+			a:SetOrder(order)
+			a:SetFromAlpha(step[1])
+			a:SetToAlpha(step[2])
+			a:SetDuration(step[3])
+			a:SetSmoothing(step[4])
+		end
+		if onLoop then
+			g:SetScript("OnLoop", onLoop)
+		end
+		return g
+	end)
+	return ok and group or false
+end
+
+function Highlight.play(group, period, phase)
+	group:Stop()
+	group:Play(false, ((GetTime() / period + (phase or 0)) % 1) * period)
+end
+
+-- Border and timer glow: from `low` to full and back, once a breath. Flashing Off (or no animations in
+-- this client): steady, where the pulse spends most of its time.
+function Highlight.breathe(frame, on, steady, low)
+	if frame.rfPulse == nil then
+		local half = Highlight.BREATH / 2
+		frame.rfPulse = Highlight.loop(frame, { { low, 1, half, "IN_OUT" }, { 1, low, half, "IN_OUT" } })
+	end
+	local pulse = frame.rfPulse
+	if pulse then
+		pulse:Stop()
+	end
+	frame:SetAlpha(low + (1 - low) * 0.8)
+	if on and not steady and pulse then
+		Highlight.play(pulse, Highlight.BREATH)
+	end
+end
+
+-- A star: fades in and out once a twinkle, moving to another spot on the edge between twinkles.
+function Highlight.twinkle(card, star, on)
+	if star.rfTwinkle == nil then
+		local half = Highlight.TWINKLE / 2
+		star.rfTwinkle = Highlight.loop(star, { { 0, 1, half, "IN" }, { 1, 0, half, "OUT" } }, function()
+			Highlight.placeStar(card, star)
+		end)
+	end
+	local twinkle = star.rfTwinkle
+	if twinkle then
+		twinkle:Stop()
+	end
+	star:SetAlpha(0)
+	if on and twinkle then
+		Highlight.placeStar(card, star)
+		Highlight.play(twinkle, Highlight.TWINKLE, star.phase)
+	end
+end
+
+function Highlight.placeStar(card, star)
+	local along, side = math.random(), math.random(4)
+	star:ClearAllPoints()
+	if side <= 2 then
+		star:SetPoint("CENTER", card.hl, side == 1 and "TOPLEFT" or "BOTTOMLEFT", along * card.frame:GetWidth(), 0)
+	else
+		star:SetPoint("CENTER", card.hl, side == 3 and "TOPLEFT" or "TOPRIGHT", 0, -along * card.frame:GetHeight())
+	end
+end
+
+-- Stops what Highlight.style started (a hidden frame's animations would only wait).
+function Highlight.still(hl)
+	for _, frame in ipairs({ hl.border or false, hl.bar or false }) do
+		if frame and frame.rfPulse then
+			frame.rfPulse:Stop()
+		end
+	end
+	for _, star in ipairs(hl.stars or {}) do
+		if star.rfTwinkle then
+			star.rfTwinkle:Stop()
+		end
+	end
 end
 
 function Highlight.valid(style)
@@ -1999,25 +3243,31 @@ function Highlight.on(card)
 		Highlight.off(card)
 		return
 	end
-	if not (card.hl and card.hl.wanted == style and card.hl.steady == (db.flashing == "off") and card.hl:IsShown()) then
+	if not (card.hl and card.hl.wanted == style and card.hl.steady == (History.noFlash()) and card.hl:IsShown()) then
 		Highlight.style(card, style)
 		card.hl.wanted = style -- (what was asked for; hl.style is what shows, e.g. a steady border for Sparkles)
-		card.hl.steady = db.flashing == "off"
+		card.hl.steady = History.noFlash()
 	end
 	if not Highlight.cards[card] then
 		Highlight.cards[card] = true
 		Highlight.count = Highlight.count + 1
 	end
-	if not Highlight.driver then
-		Highlight.driver = CreateFrame("Frame", nil, main)
-		Highlight.driver:SetScript("OnUpdate", Guard.wrapUpdate("highlight", Highlight.tick, 1 / 30))
+	if not card.buttons.rfHighlightHook then
+		-- Buttons gone (rolled, roll over, card reused): no highlight. Here as well as where the buttons hide,
+		-- so no path can leave a drop glowing.
+		card.buttons.rfHighlightHook = true
+		card.buttons:HookScript("OnHide", function(buttons)
+			if not buttons:IsShown() and Highlight.cards[card] then
+				Guard.call("highlight", Highlight.off, card)
+			end
+		end)
 	end
-	Highlight.driver:Show()
 end
 
 function Highlight.off(card)
 	local hl = card.hl
 	if hl then
+		Highlight.still(hl)
 		hl:Hide()
 		hl.style, hl.wanted = nil, nil
 		if hl.bar then hl.bar:Hide() end -- (on the timer bar, not inside hl)
@@ -2031,7 +3281,7 @@ end
 -- One gold flash of the window's edge when new loot brings it back from History (Accessibility "Flashing":
 -- "persist" repeats it until you hover the window; "off" never flashes).
 function History.flashWindow()
-	if db.flashing == "off" or not main then
+	if History.noFlash() or not main then
 		return
 	end
 	local f = History.flash
@@ -2042,8 +3292,8 @@ function History.flashWindow()
 		f:EnableMouse(false)
 		f.isWindowFlash = true -- (tests find it by this)
 		-- Trace the panel's own border: a gold, additive copy of each piece of Blizzard's frame art (same
-		-- texture, coordinates and place), so the flash sits exactly on the visible border (2026-11-10: plain
-		-- edges along the frame's rectangle didn't line up with the art).
+		-- texture, coordinates and place), so the flash sits exactly on the visible border (plain edges
+		-- along the frame's rectangle didn't line up with the art).
 		local traced = 0
 		if main.NineSlice and main.NineSlice.GetRegions then
 			for _, r in ipairs({ main.NineSlice:GetRegions() }) do
@@ -2077,28 +3327,65 @@ function History.flashWindow()
 			end
 		end
 		History.flash = f
+		pcall(function() -- (the engine plays the pulse; a client without it gets the Lua one)
+			local group = f:CreateAnimationGroup()
+			for order, step in ipairs({ { 0, 1, "OUT" }, { 1, 0, "IN" } }) do
+				local a = group:CreateAnimation("Alpha")
+				a:SetOrder(order)
+				a:SetFromAlpha(step[1])
+				a:SetToAlpha(step[2])
+				a:SetDuration(0.45)
+				a:SetSmoothing(step[3])
+			end
+			f.pulse = group
+		end)
 	end
+	f.token = (f.token or 0) + 1
+	local token = f.token
 	f:SetAlpha(0)
 	f:Show()
-	local function once()
+	local function again()
+		if f.token ~= token then
+			return
+		end
+		if db.flashing == "persist" and main:IsVisible() and not main:IsMouseOver() then
+			History.pulseFlash(f, again)
+		else
+			f:Hide()
+		end
+	end
+	History.pulseFlash(f, again)
+end
+
+-- One 0.9 s pulse of the window's flash, then `after`.
+function History.pulseFlash(f, after)
+	if f.pulse then
+		f.pulse:Stop()
+		f.pulse:Play()
+		C_Timer.After(0.9, after)
+	else
 		tween("main:flash", 0.9, function(p)
 			f:SetAlpha(math.sin(p * math.pi))
-		end, function()
-			if db.flashing == "persist" and main:IsVisible() and not main:IsMouseOver() then
-				once()
-			else
-				f:Hide()
-			end
-		end, true) -- (linear: an even pulse)
+		end, after, true) -- (linear: an even pulse)
 	end
-	once()
+end
+
+function History.endFlash()
+	local f = History.flash
+	if f then
+		f.token = (f.token or 0) + 1
+		tweens["main:flash"] = nil
+		if f.pulse then
+			f.pulse:Stop()
+		end
+		f:Hide()
+	end
 end
 
 -- Stops a flash at once (Flashing set to Off).
 function History.stopFlash()
 	if History.flash and History.flash:IsShown() then
-		tweens["main:flash"] = nil
-		History.flash:Hide()
+		History.endFlash()
 	end
 end
 
@@ -2108,7 +3395,7 @@ function Highlight.restyle()
 		if card.buttons:IsShown() then
 			Highlight.on(card)
 		else
-			Highlight.off(card) -- stopped waiting since the last tick (the window may be hidden)
+			Highlight.off(card) -- stopped waiting (the window may be hidden)
 		end
 	end
 	for _, card in ipairs(cards) do
@@ -2118,56 +3405,8 @@ function Highlight.restyle()
 	end
 end
 
--- 30 updates a second (a slow pulse looks the same as at the full frame rate, at half the cost; the rate
--- is set where it's hooked up, in Highlight.on).
-function Highlight.tick(driver, elapsed)
-	Highlight.t = Highlight.t + elapsed
-	local t = Highlight.t
-	local level = 0.5 - 0.5 * math.cos(t / 1.2 * 2 * math.pi) -- 0 -> 1 -> 0, one breath every 1.2 s
-	if db.flashing == "off" then
-		level = 0.8 -- Accessibility: steady
-	end
-	for card in pairs(Highlight.cards) do
-		local hl = card.hl
-		-- Buttons gone (rolled, roll over, card reused): no highlight. Checked here as well as where the
-		-- buttons hide, so no path can leave a drop glowing.
-		if not (hl and card.buttons:IsShown()) then
-			Highlight.off(card)
-		else
-			local style = hl.style
-			if style == "border" or style == "all" then
-				hl.border:SetAlpha(0.35 + 0.65 * level)
-			end
-			if style == "timer" or style == "all" then
-				hl.bar:SetAlpha(0.3 + 0.7 * level)
-			end
-			if (style == "sparkle" or style == "all") and not hl.steady then
-				for _, star in ipairs(hl.stars) do
-					local x = t / 1.4 + star.phase -- each star: one twinkle every 1.4 s, in turn
-					local cycle = math.floor(x)
-					if cycle ~= star.cycle then -- a new twinkle: move to another spot on the edge
-						star.cycle = cycle
-						local along, side = math.random(), math.random(4)
-						star:ClearAllPoints()
-						if side <= 2 then
-							star:SetPoint("CENTER", hl, side == 1 and "TOPLEFT" or "BOTTOMLEFT", along * card.frame:GetWidth(), 0)
-						else
-							star:SetPoint("CENTER", hl, side == 3 and "TOPLEFT" or "TOPRIGHT", 0, -along * card.frame:GetHeight())
-						end
-					end
-					local s = math.sin((x - cycle) * math.pi) -- 0 -> 1 -> 0 over the twinkle
-					star:SetAlpha(s * s * s)
-				end
-			end
-		end
-	end
-	if Highlight.count == 0 then
-		driver:Hide()
-	end
-end
-
 refreshButtons = function(card)
-	if not (db.rollFromWindow and not Guard.fallback and (card.rollID or card.demoWaitsForYou or card.twins)
+	if not (History.rollsHere() and not Guard.fallback and (card.rollID or card.demoWaitsForYou or card.twins)
 		and not card.finished and not card.youRolled
 		and not (card.twins and twinOpenRoll(card.twins, ownRoll(card)) == nil)) then
 		-- (Runs on every update of every drop: only what's showing is hidden.)
@@ -2200,13 +3439,16 @@ refreshButtons = function(card)
 		if button.allowed ~= allowed then
 			button.allowed = allowed
 			button:SetEnabled(allowed)
+			if not allowed then
+				button.glow:Hide()
+			end
 			button:GetNormalTexture():SetDesaturated(not allowed)
 			button:SetAlpha(allowed and 1 or 0.35)
 		end
 	end
 	if card.buttons.wide ~= wide then
 		card.buttons.wide = wide
-		card.buttons:SetWidth((wide and 4 or 3) * 22)
+		card.buttons:SetWidth((wide and 4 or 3) * Scale.look().step)
 	end
 	if not card.buttons:IsShown() then
 		card.buttons:Show()
@@ -2218,9 +3460,8 @@ refreshButtons = function(card)
 end
 
 ----------------------------------------------------------------------------------------------------
--- Frame reuse. WoW never frees a frame, so a long raid night would otherwise keep every drop's card
--- and roll lines in memory until a reload. Cards leaving the history (and demo cards) go back to these
--- pools, reset, and new drops take from them before creating anything.
+-- Frame reuse. WoW never frees a frame, so cards leaving the list go back to pools and new drops take
+-- from them first.
 ----------------------------------------------------------------------------------------------------
 
 local framesMade = { cards = 0, lines = 0 } -- how many were ever created (for /rollframes diag and the stress test)
@@ -2243,15 +3484,21 @@ local function acquireLine(card)
 		return createLine(card)
 	end
 	line:SetParent(card.frame)
+	-- On its drop's layer, just above it: the window changes layer and raises itself while a roll waits (v1.3),
+	-- and a hidden pooled line could keep an old layer or level and be drawn under the drop (names gone).
+	-- Detailed view only: no other view pools player lines.
+	line:SetFrameStrata(card.frame:GetFrameStrata())
+	line:SetFrameLevel(card.frame:GetFrameLevel() + 1)
 	line:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
 	line.slide, line.index, line.entry, line.drawn, line.group = 0, nil, nil, nil, nil
-	line.bg:SetColorTexture(1, 0.82, 0.2, 0)
+	History.setAlpha(line.bg, 0)
 	line.selfBg:Hide()
 	line.selfMark:Hide()
 	line.check:Hide()
 	line.shine:Hide()
 	line.shine:SetAlpha(1)
-	line:SetAlpha(1)
+	History.stopSweep(line) -- (a pooled line: no sweep left running from its last drop)
+	History.setAlpha(line, 1)
 	line:Show()
 	return line
 end
@@ -2267,8 +3514,13 @@ local function releaseCard(card)
 		end
 	end
 	releaseLines(card)
+	History.stopGlow(card.winnerIcon)
+	for _, region in ipairs({ card.frame, card.waiting, card.winnerText, card.winnerRoll, card.winnerIcon, card.mineIcon,
+		card.mineRoll }) do
+		History.stopFade(region) -- (their `done` was the old drop's)
+	end
 	if Highlight.cards[card] then
-		Guard.call("highlight", Highlight.off, card) -- (its next drop starts without one)
+		Guard.call("highlight", Highlight.off, card)
 	end
 	card.lastRolls = nil -- (a raid's whole roll list: about 16 KB a card)
 	card.timer:Hide()
@@ -2285,7 +3537,7 @@ dismissCard = function(card, why)
 		return
 	end
 	card.dismissing = true
-	if card.historyKey then
+	if card.historyKey and not card.demo then
 		skippedHistory[card.historyKey] = card.dropMark or true
 	end
 	if logging() and not card.demo then
@@ -2293,9 +3545,7 @@ dismissCard = function(card, why)
 	end
 	card.timer:Hide()
 	card.buttons:Hide()
-	tween(card.id .. ":dismiss", 0.35, function(p)
-		card.frame:SetAlpha(1 - p)
-	end, function()
+	History.fadeRow(card, 0, 0.35, function()
 		for i, c in ipairs(cards) do
 			if c == card then
 				table.remove(cards, i)
@@ -2319,6 +3569,11 @@ end
 
 -- Clears what a reused card showed for its last drop. setItem, setRoll and friends fill it in again.
 local function resetCard(card)
+	History.clearRowSweep(card)
+	if card.buttons.wide then -- (the last drop allowed Transmog; the item level sits beside this bar)
+		card.buttons.wide = false
+		card.buttons:SetWidth(3 * (card.look or Scale.look()).step)
+	end
 	for _, key in ipairs(DROP_FIELDS) do
 		card[key] = nil
 	end
@@ -2329,11 +3584,18 @@ local function resetCard(card)
 	card.timer:SetValue(1)
 	card.timer.step = nil
 	card.winnerText:SetText("")
-	card.winnerText:SetAlpha(0)
-	card.winnerIcon:SetAlpha(0)
+	card.winnerText.lineText = nil
+	History.setAlpha(card.winnerText, 0)
+	if card.winnerRoll.hasText then
+		card.winnerRoll.hasText = nil
+		card.winnerRoll:SetText("")
+	end
+	History.setAlpha(card.winnerRoll, 0)
+	card.winnerFull = nil
+	History.setAlpha(card.winnerIcon, 0)
 	card.winnerIcon:Hide()
 	card.waiting:SetText("")
-	card.waiting:SetAlpha(1)
+	History.setAlpha(card.waiting, 1)
 	card.waiting:Show()
 	card.buttons:SetAlpha(1) -- (a guard from its last drop)
 	History.wideTimer(card) -- (a Summary drop's thin timer: back to the normal one)
@@ -2349,11 +3611,7 @@ local function insertCard(card)
 	table.insert(cards, 1, card)
 end
 
--- The roll list for a tooltip: everyone's choice and roll (Summary and None show no player lines).
--- The rolls in a drop's tooltip: each player's choice as the same icon their line in the window shows
--- (easier to tell apart at a glance than words), then the roll.
--- In a raid only the Need rolls are listed, then one line counting the rest (40 lines would run off the
--- screen; user, 2026-11-10: a setting for this may follow, see docs/todo/RollFrames.md).
+-- In a raid only Need rolls are listed, then one line counting the rest (40 lines would run off the screen).
 local function addRollsToTooltip(card)
 	if not card.lastRolls then
 		return
@@ -2362,6 +3620,7 @@ local function addRollsToTooltip(card)
 	GameTooltip:AddLine(" ")
 	GameTooltip:AddLine(raid and "Need rolls" or "Rolls", 1, 1, 1)
 	local others -- (raid) how many chose each of the rest
+	local listed = 0
 	for _, r in ipairs(card.lastRolls) do
 		local state = safe(r.state, STATE.NOROLL)
 		if raid and state ~= STATE.NEED and state ~= STATE.NEED_OFF then
@@ -2370,7 +3629,7 @@ local function addRollsToTooltip(card)
 		else
 			local choice
 			if state == STATE.NOROLL then
-				choice = card.finished and "no roll" or "..."
+				choice = card.finished and "no roll" or "deciding"
 			else
 				choice = "|A:" .. (STATE_ATLAS[state] or STATE_ATLAS[STATE.PASS]) .. ":14:14|a"
 				if state == STATE.NEED_OFF then
@@ -2378,9 +3637,14 @@ local function addRollsToTooltip(card)
 				end
 			end
 			local roll = safe(r.roll)
+			-- Number before icon, so the icons line up on the right edge.
 			GameTooltip:AddDoubleLine(classColored(safe(r.playerName, "?"), safe(r.playerClass)),
-				choice .. (roll and ("  " .. roll) or ""), 1, 1, 1, 0.8, 0.8, 0.8)
+				(roll and (roll .. "  ") or "") .. choice, 1, 1, 1, 0.8, 0.8, 0.8)
+			listed = listed + 1
 		end
+	end
+	if raid and listed == 0 then
+		GameTooltip:AddLine("No Need rolls", 0.6, 0.6, 0.6)
 	end
 	if others then
 		local parts = {}
@@ -2390,9 +3654,9 @@ local function addRollsToTooltip(card)
 			end
 		end
 		if others[STATE.NOROLL] then
-			parts[#parts + 1] = others[STATE.NOROLL] .. (card.finished and " no roll" or " deciding")
+			parts[#parts + 1] = (card.finished and "no roll " or "deciding ") .. others[STATE.NOROLL]
 		end
-		GameTooltip:AddLine(table.concat(parts, "   "), 0.8, 0.8, 0.8)
+		GameTooltip:AddLine("Others: " .. table.concat(parts, "   "), 0.8, 0.8, 0.8)
 	end
 end
 
@@ -2412,21 +3676,17 @@ local function createCard(link, opts)
 	card.reserved = opts and opts.reserve or 0
 	card.linesMode = currentLinesMode()
 	if History.shown and GetTime() - (History.flashedAt or -100) > 3 then
-		-- new loot while older drops are out: the list goes to its newest end; one flash says so (one per burst:
-		-- a boss's three or four drops arrive within a second)
+		-- One flash per burst: a boss's drops arrive within a second.
 		History.flashedAt = GetTime()
 		Guard.call("flash", History.flashWindow)
 	end
-	scrollToNewestPending = true -- show the new drop
+	scrollToNewestPending = true
 	if reused then
 		card.frame:SetPoint("LEFT", content, "LEFT")
 		card.frame:SetPoint("RIGHT", content, "RIGHT")
 		placeHeader(card)
 		insertCard(card)
-		card.frame:SetAlpha(0)
-		tween(card.id .. ":appear", 0.3, function(p)
-			card.frame:SetAlpha(p)
-		end)
+		History.fadeRow(card, 1, 0.3, nil, 0)
 		resize(card, true)
 		return card
 	end
@@ -2440,7 +3700,7 @@ local function createCard(link, opts)
 	f.bg:SetColorTexture(1, 1, 1, 0.05)
 
 	local icon = CreateFrame("Button", nil, f)
-	icon:SetSize(ICON, ICON)
+	icon:SetSize(Scale.iconSize, Scale.iconSize)
 	icon:SetPoint("TOPLEFT", 3, -3)
 	icon.tex = icon:CreateTexture(nil, "ARTWORK")
 	icon.tex:SetAllPoints()
@@ -2449,39 +3709,46 @@ local function createCard(link, opts)
 	icon.border:SetPoint("BOTTOMRIGHT", 2, -2)
 	icon.border:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
 	icon.border:SetBlendMode("ADD")
-	-- One tooltip for the whole drop, wherever the mouse is on its bar (user, 2026-11-10): the item, then
-	-- everyone's rolls when the drop doesn't show them as lines. The bar only takes mouse movement, so a click
-	-- still reaches the window (drag it from the list). The roll buttons keep their own small tooltips.
-	-- extra: adds lines at the end (a roll button says which it is).
-	local function showTooltip(self, extra)
+	-- One tooltip for the whole drop (or only its icon: "Item tooltip"). The bar takes mouse motion only, so
+	-- clicks reach the window (drag it from the list).
+	local function showTooltip(self)
 		History.tooltipBeside(self, f)
-		if card.demo then
+		if card.demo and not card.link then
 			GameTooltip:SetText(card.itemName or "Demo item")
 			GameTooltip:AddLine("Demo mode: a made-up item.", 0.8, 0.8, 0.8)
 		elseif card.link then
 			GameTooltip:SetHyperlink(card.link)
+			if card.demo then
+				GameTooltip:AddLine("Demo mode: nothing is rolled.", 0.8, 0.8, 0.8)
+			end
 		else
 			GameTooltip:SetText(card.itemName or "Item")
 		end
-		if card.linesMode ~= "all" and (not card.collapsed or card.linesMode == "summary") then
-			addRollsToTooltip(card) -- no player lines on the card: the item's tooltip lists the rolls
+		if card.linesMode ~= "all" or card.collapsed then
+			addRollsToTooltip(card) -- no player lines showing: the item's tooltip lists the rolls
 		end
-		if type(extra) == "function" then
-			extra(self)
+		if card.rollEnded and not card.winner and not card.allPassed then
+			GameTooltip:AddLine(" ")
+			GameTooltip:AddLine("The game didn't say who won. Blizzard's loot history (/loot) may show it.",
+				0.6, 0.6, 0.6, true)
 		end
 		GameTooltip:Show()
 	end
 	card.showTooltip = showTooltip
 	if f.SetMouseMotionEnabled then
 		f:SetMouseMotionEnabled(true) -- (movement only: clicks go straight through to the window)
-		f:SetScript("OnEnter", showTooltip)
+		f:SetScript("OnEnter", function(self)
+			if db.itemTooltip ~= "icon" then
+				showTooltip(self)
+			end
+		end)
 		f:SetScript("OnLeave", GameTooltip_Hide)
 	end
 	icon:SetScript("OnEnter", showTooltip) -- (the icon takes clicks too: shift-click links the item)
 	icon:SetScript("OnLeave", GameTooltip_Hide)
 	icon:SetScript("OnClick", function()
 		if card.link and IsModifiedClick() then
-			HandleModifiedItemClick(card.link)
+			History.itemClick(card.link)
 		end
 	end)
 	card.icon = icon
@@ -2499,7 +3766,7 @@ local function createCard(link, opts)
 	card.timer:SetStatusBarColor(1, 0.75, 0.1)
 	card.timerRed = false
 	card.timer:SetHeight(4)
-	card.timer:SetPoint("BOTTOMLEFT", icon, "BOTTOMRIGHT", 6, 1)
+	card.timer:SetPoint("BOTTOMLEFT", icon, "BOTTOMRIGHT", 6, Scale.timerY()) -- (as Scale.placeTimer)
 	card.timer:SetPoint("RIGHT", f, "RIGHT", -6, 0)
 	card.timer:SetMinMaxValues(0, 1)
 	card.timer.bg = card.timer:CreateTexture(nil, "BACKGROUND")
@@ -2538,31 +3805,36 @@ local function createCard(link, opts)
 
 	card.winnerIcon = f:CreateTexture(nil, "OVERLAY")
 	card.winnerIcon:SetSize(14, 14)
-	card.winnerIcon:SetAlpha(0)
+	History.setAlpha(card.winnerIcon, 0)
 	card.winnerText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	-- Row grid (2026-11-10): line 2's first piece starts in the item name's column (icon right + 6), on one
+	-- Row grid: line 2's first piece starts in the item name's column (icon right + 6), on one
 	-- baseline (icon bottom + 4) for the counts, the winner and the boss. The winner's 14 px choice icon sits
 	-- in that column and the name follows it.
 	card.winnerText:SetPoint("BOTTOMLEFT", icon, "BOTTOMRIGHT", 24, 4)
 	card.winnerText:SetPoint("RIGHT", f, "RIGHT", -6, 0)
 	card.winnerText:SetJustifyH("LEFT")
 	card.winnerText:SetWordWrap(false)
-	card.winnerText:SetAlpha(0)
-	card.winnerIcon:SetPoint("RIGHT", card.winnerText, "LEFT", -4, 0)
+	History.setAlpha(card.winnerText, 0)
+	card.winnerRoll = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	card.winnerRoll:SetPoint("BOTTOMLEFT", icon, "BOTTOMRIGHT", 22, 4)
+	card.winnerRoll:SetWidth(History.rollWidth(card.winnerRoll))
+	card.winnerRoll:SetJustifyH("RIGHT")
+	History.setAlpha(card.winnerRoll, 0)
+	card.winnerRoll.choiceIcon = card.winnerIcon -- (anchored by History.setWinnerLine)
 
-	-- The summary line ("Player lines: Summary"): counts of each choice; hovering the drop lists everyone.
-	card.waiting = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	card.waiting:SetJustifyH("LEFT")
-	card.waiting:SetWordWrap(false)
+	-- Summary line: one column per choice, so counts line up across rows.
+	card.waiting = History.countsLine(f)
 
-	-- Your own choice and roll, where the roll buttons were ("Player lines" Summary or None).
-	-- Your choice, once made: the icon exactly where the right-hand roll button was (same size and corner),
-	-- your roll number just left of it.
+	-- Your choice (Summary or None): the icon in the right-hand button's spot, your roll in the column left of it.
 	card.mineIcon = f:CreateTexture(nil, "ARTWORK")
-	card.mineIcon:SetSize(20, 20)
-	card.mineIcon:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
+	card.mineIcon:SetSize(Scale.look().size, Scale.look().size) -- (follows Roll buttons: Scale.styleCard)
+	card.mineIcon:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, Scale.look().top)
+	-- Greyed, as a roll button that can't be clicked: it's only an indicator now.
+	card.mineIcon:SetDesaturated(true)
+	card.mineIcon:SetAlpha(0.35)
 	card.mineRoll = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	card.mineRoll:SetPoint("RIGHT", card.mineIcon, "LEFT", -3, 0)
+	card.mineRoll:SetJustifyH("CENTER")
+	History.placeMine(card)
 	card.mineIcon:Hide()
 	card.mineRoll:Hide()
 	card.setMine = function(state, roll)
@@ -2570,11 +3842,18 @@ local function createCard(link, opts)
 			return
 		end
 		card.mineState, card.mineRollShown = state, roll
-		if state and state ~= STATE.NOROLL and not card.finished and card.linesMode ~= "all" then
+		if state and state ~= STATE.NOROLL and not card.finished then
+			History.placeMine(card)
+			-- (A fade, or animations off after errors, may have left them at 0. The game keeps 0.35 as 0.3499...)
+			if not card.mineIcon:IsShown() and math.abs(card.mineIcon:GetAlpha() - 0.35) > 0.01 then
+				History.setAlpha(card.mineIcon, 0.35)
+				History.setAlpha(card.mineRoll, 1)
+			end
 			card.mineIcon:SetAtlas(STATE_ATLAS[state] or STATE_ATLAS[STATE.PASS])
 			card.mineIcon:Show()
 			card.mineRoll:SetText(state == STATE.PASS and "" or (roll and tostring(roll) or "|cff888888...|r"))
-			card.mineRoll:Show()
+			-- Detailed: your roll is on your own line, in the roll column with everyone's; only the icon here.
+			card.mineRoll:SetShown(card.linesMode ~= "all")
 		else
 			card.mineIcon:Hide()
 			card.mineRoll:Hide()
@@ -2582,22 +3861,20 @@ local function createCard(link, opts)
 		placeHeader(card)
 	end
 
-	-- The boss the drop came from, on history rows (R35). Small, right-aligned, cut short if long.
+	-- The boss the drop came from, on history rows.
 	card.boss = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	card.boss:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -6, 7) -- (line 2's baseline: icon bottom + 4)
+	card.boss:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -6, Scale.lineTwo()) -- (line 2's baseline: icon bottom + 4)
 	card.boss:SetWidth(110)
 	card.boss:SetJustifyH("RIGHT")
 	card.boss:SetWordWrap(false)
 	card.boss:Hide()
 
 	card.buttons = createButtons(card)
+	card.look = Scale.look() -- (built in it; Scale.restyleRows restyles on a change)
 	placeHeader(card)
 
 	insertCard(card)
-	f:SetAlpha(0)
-	tween(card.id .. ":appear", 0.3, function(p)
-		f:SetAlpha(p)
-	end)
+	History.fadeRow(card, 1, 0.3, nil, 0)
 	resize(card, true)
 	return card
 end
@@ -2611,7 +3888,7 @@ local function setItem(card, link, name, icon, quality)
 	elseif card.keyLink ~= card.link then
 		card.keyLink, card.itemKey = card.link, itemKeyFromLink(card.link)
 	end
-	-- Secret values can't be compared; if any input is one, always redraw (as before).
+	-- Secret values can't be compared; if any input is one, always redraw.
 	local comparable = not (isSecret(card.link) or isSecret(name) or isSecret(icon) or isSecret(quality))
 	if comparable and card.itemShown and card.shownLink == card.link and card.shownNameArg == name
 		and card.shownIconArg == icon and card.shownQualityArg == quality and card.ilvlSettled then
@@ -2636,8 +3913,7 @@ local function setItem(card, link, name, icon, quality)
 	card.icon.border:SetVertexColor(r, g, b)
 	card.name:SetText(card.itemName)
 	card.name:SetTextColor(r, g, b)
-	-- Item level, for gear only (recipes and containers have one too, but it means nothing there).
-	-- Item data can arrive late; setItem runs again on later updates and fills it in then.
+	-- Gear only: recipes and containers have an item level too, but it means nothing there.
 	local level
 	card.ilvlSettled = false
 	if card.link and C_Item and C_Item.IsEquippableItem and C_Item.GetDetailedItemLevelInfo then
@@ -2669,7 +3945,7 @@ local function setRoll(card, key, entry, quiet)
 		card.lines[key] = line
 		line.slide = quiet and 0 or -18
 		if not quiet then
-			line:SetAlpha(0) -- (it slides and fades in; a quiet one is already at full alpha)
+			History.setAlpha(line, 0) -- (it slides and fades in; a quiet one is already at full alpha)
 		end
 		-- A new player goes in at the end of their group; the lines after it move down one row (usually
 		-- none: the first list comes sorted, and later newcomers are rare).
@@ -2705,14 +3981,7 @@ local function setRoll(card, key, entry, quiet)
 	end
 end
 
--- "[need] 2   [greed] 1   [pass] 3" ("Player lines: Summary"; the icons dimmed). Only rebuilt when a count changes.
--- One format per mix of counts (at most 64), made the first time that mix shows: a changed count then makes
--- no new strings (a raid's summaries change on every roll). args: scratch for the numbers.
--- Each choice is its icon (as on the player lines and in the tooltip), dimmed to 60% to sit with the grey
--- text (an icon in text can only be tinted, not made grey; trial, user 2026-11-10).
-local SUMMARY_FORMATS = { args = {}, icon = function(state)
-	return "|A:" .. STATE_ATLAS[state] .. ":12:12:0:0:153:153:153|a %d"
-end }
+-- Summary counts; redrawn only when a count changes.
 local function setSummary(card, need, greed, transmog, pass)
 	-- (Who's still deciding isn't counted here: the timer says the roll is on, and the tooltip shows each one.)
 	local key = ((need * 64 + greed) * 64 + transmog) * 64 + pass
@@ -2720,24 +3989,8 @@ local function setSummary(card, need, greed, transmog, pass)
 		return
 	end
 	card.summaryKey = key
-	local mix = (need > 0 and 1 or 0) + (greed > 0 and 2 or 0) + (transmog > 0 and 4 or 0) + (pass > 0 and 8 or 0)
-	local format = SUMMARY_FORMATS[mix]
-	if not format then
-		local icons = {}
-		if need > 0 then icons[#icons + 1] = SUMMARY_FORMATS.icon(STATE.NEED) end
-		if greed > 0 then icons[#icons + 1] = SUMMARY_FORMATS.icon(STATE.GREED) end
-		if transmog > 0 then icons[#icons + 1] = SUMMARY_FORMATS.icon(STATE.TRANSMOG) end
-		if pass > 0 then icons[#icons + 1] = SUMMARY_FORMATS.icon(STATE.PASS) end
-		format = #icons > 0 and table.concat(icons, "   ") or "..." -- (nobody has chosen yet)
-		SUMMARY_FORMATS[mix] = format
-	end
-	local args, n = SUMMARY_FORMATS.args, 0
-	if need > 0 then n = n + 1; args[n] = need end
-	if greed > 0 then n = n + 1; args[n] = greed end
-	if transmog > 0 then n = n + 1; args[n] = transmog end
-	if pass > 0 then n = n + 1; args[n] = pass end
 	placeSummary(card)
-	card.waiting:SetFormattedText(format, unpack(args, 1, n))
+	card.waiting:SetCounts(need, greed, pass, transmog)
 end
 
 -- One full list of players (shaped like C_LootHistory's rollInfos) drawn as "Player lines" says:
@@ -2745,9 +3998,8 @@ end
 -- lists everyone again; lines whose player is unchanged are skipped.
 local function applyRolls(card, rollInfos, quiet)
 	local mode = card.linesMode
-	-- Player lines only for a drop shown full size: a compact row (collapsed) has none, and neither does a drop
-	-- already decided when first seen (e.g. Blizzard's replay after a /reload), which collapses at once.
-	-- (A late update for a compact row used to slide a stray line in over the next drop.)
+	-- No player lines on a compact row, or on a drop already decided when first seen (it collapses at once):
+	-- a late update would slide a stray line in over the next drop.
 	local drawLines = not (card.collapsed or card.instant)
 	if drawLines or mode == "summary" then
 		card.lastRolls = rollInfos -- (a compact Summary row keeps it for its hover list)
@@ -2802,9 +4054,9 @@ local function applyRolls(card, rollInfos, quiet)
 			elseif state == STATE.PASS then
 				pass = pass + 1
 			end
-			if isSelf then
-				card.setMine(state == STATE.NOROLL and card.clickedState or state, safe(r.roll))
-			end
+		end
+		if isSelf then -- (every view: your choice takes the buttons' place)
+			card.setMine(state == STATE.NOROLL and card.clickedState or state, safe(r.roll))
 		end
 		if isSelf and state ~= STATE.NOROLL then
 			card.youRolled = true
@@ -2836,6 +4088,42 @@ refreshSummary = function(card)
 	end
 end
 
+-- Roll buttons changed, or "Roll from this window" switched: every drop, pooled drop and History
+-- row takes the new look and row height at once, then the list is laid out again.
+function Scale.restyleRows()
+	History.placeClock() -- (it follows the Need column)
+	local rowsChanged = Scale.setRows()
+	for _, list in ipairs({ cards, cardPool }) do
+		for _, card in ipairs(list) do
+			if card.look ~= Scale.look() or rowsChanged then
+				Scale.styleCard(card)
+				if list == cards then
+					placeHeader(card) -- (the item level beside your choice: its spot follows the size)
+				end
+			end
+		end
+	end
+	if not rowsChanged then
+		return
+	end
+	for _, card in ipairs(cards) do
+		for i, key in ipairs(card.lineOrder) do
+			local line = card.lines[key]
+			if line then
+				placeLine(card, line, i) -- (the lines start under the taller or shorter item row)
+			end
+		end
+		resize(card, true)
+	end
+	for _, row in pairs(History.rows) do
+		row:SetHeight(History.ROW_H - CARD_GAP)
+		row.when:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -6, Scale.lineTwo())
+		row.icon:SetSize(Scale.iconSize, Scale.iconSize)
+	end
+	trimPending = true
+	layout()
+end
+
 -- "Player lines" changed: redraw each roll in progress from its last list of players.
 local function redrawLiveCards()
 	for _, card in ipairs(cards) do
@@ -2851,20 +4139,21 @@ local function redrawLiveCards()
 				History.wideTimer(card) -- (Summary's thin timer goes back under the item name)
 			end
 			card.waiting:SetShown(mode == "summary")
-			card.waiting:SetAlpha(1)
+			History.setAlpha(card.waiting, 1)
 			if card.lastRolls then
 				applyRolls(card, card.lastRolls, true)
 			end
 			if card.finished and mode == "summary" then
-				card.waiting:SetAlpha(0) -- (decided: line 2 is the winner's, as finish leaves it)
+				History.setAlpha(card.waiting, 0) -- (decided: line 2 is the winner's, as finish leaves it)
 			end
-			if mode ~= "all" and card.clickedState and not card.selfReported then
+			if card.clickedState and not card.selfReported then
 				card.setMine(card.clickedState) -- clicked before the loot history listed anyone
 			end
 			if card.finished then
 				if mode == "all" then
-					card.winnerText:SetAlpha(0)
-					card.winnerIcon:SetAlpha(0)
+					History.setAlpha(card.winnerText, 0)
+					History.setAlpha(card.winnerRoll, 0)
+					History.setAlpha(card.winnerIcon, 0)
 					if card.winnerKey and card.lines[card.winnerKey] then
 						playWinnerSweep(card, card.lines[card.winnerKey])
 					end
@@ -2903,16 +4192,20 @@ function History.lateResult(card, winner, allPassed)
 	for _, rec in ipairs(History.records) do
 		local c = History.cardOf[rec]
 		if c and c.card == card and c.gen == card.gen then
-			rec.winner = card.winnerText:GetText()
+			rec.winner = card.winnerFull
 			rec.atlas = allPassed and STATE_ATLAS[STATE.PASS] or (winner and (STATE_ATLAS[winner.state] or STATE_ATLAS[STATE.GREED])) or nil
+			rec.mine = History.mineOf(winner) -- (a late result you won is yours too)
 			break
 		end
+	end
+	if winner and winner.isSelf and card.collapsed then
+		History.keepWinTint(card) -- (its compact row gets the kept tint)
 	end
 end
 
 -- A roll that ended for you without its drop ever being decided (you left the group, or the loot history
--- never gave a result): the drop settles as "Roll ended" and leaves like any decided drop, instead of
--- staying open forever (which kept the window from fading and the first-use question from coming).
+-- never gave a result): the drop settles as "Roll ended", or it would stay open and keep the window from
+-- fading.
 function History.settleEnded(card)
 	if card.finished or card.dismissing then
 		return
@@ -2922,9 +4215,8 @@ function History.settleEnded(card)
 end
 
 trimHistory = function()
-	-- Real rows keep the newest db.historyCount (20) of them. Demo rows do the same among themselves, as if
-	-- your history were empty, so the demo shows the real trimming without ever costing a real row. (The
-	-- dev stress test's rows are ordinary rows here; only the demo command's drops have a demo roll.)
+	-- Real rows keep the newest db.historyCount. Demo rows trim the same way among themselves, so the demo
+	-- never costs a real row. (Stress-test rows count as real: only demo drops have a demoRoll.)
 	local total, real = 0, 0
 	for _, card in ipairs(cards) do
 		if card.collapsed then
@@ -2934,7 +4226,7 @@ trimHistory = function()
 			end
 		end
 	end
-	local demoExcess = math.max(0, (total - real) - db.historyCount) -- the demo trims as if your history were empty
+	local demoExcess = math.max(0, (total - real) - db.historyCount)
 	local realExcess = math.max(0, real - db.historyCount)
 	if demoExcess == 0 and realExcess == 0 then
 		return
@@ -2999,7 +4291,7 @@ function Guard.layoutBody()
 	if not main then
 		return
 	end
-	-- The card under the cursor with your roll buttons holds still (R31). Where it is now: its distance
+	-- The card under the cursor with your roll buttons holds still. Where it is now: its distance
 	-- from the top of the visible list, and from the window's bottom edge.
 	local scrollBefore = scroll:GetVerticalScroll() -- (History's free-window shift adds to this)
 	local held = heldCard()
@@ -3048,17 +4340,24 @@ function Guard.layoutBody()
 		end
 	end
 	y = y + histH
+	if y > 0 then
+		y = y - CARD_GAP -- (no gap after the last row: the window's padding follows it, as at the sides)
+	end
 	local natural = math.max(y, HEADER_H)
 	-- The window's height (fixed), or how tall it may grow with the drops ("Grow with drops"); then it scrolls.
-	local limit = math.max(MIN_HEIGHT, (db.autoGrow and db.maxHeight or db.height) or FIXED_HEIGHT)
-	if db.snapRows then
-		limit = History.snapHeight(limit) -- (a height saved before snapping, or dragged without it, too)
-	end
-	local above = roomAbovePopups() -- R32: attached, never taller than the space above the roll popups
+	-- (Exactly as set: nothing resizes the window on its own. Only the limits below can shorten it.)
+	local limit = math.max(MIN_HEIGHT, tonumber(db.autoGrow and db.maxHeight or db.height) or FIXED_HEIGHT)
+	local above = roomAbovePopups() -- attached, never taller than the space above the roll popups
 	if above and above < limit then
-		local snapped = db.snapRows and History.snapHeight(above, true) or above
+		local snapped = db.snapDrag and History.snapHeight(above, true) or above
 		limit = math.max(MIN_HEIGHT, snapped <= above and snapped or above) -- (never taller than the room)
 	end
+	local screen = Scale.screenHeight() - 40 -- never taller than the screen (a big Window size)
+	if limit > screen then
+		local snapped = db.snapDrag and History.snapHeight(screen, true) or screen
+		limit = math.max(MIN_HEIGHT, snapped <= screen and snapped or screen)
+	end
+	main.growLimit = limit -- (the outline shows it while the corner is dragged or hovered)
 	local room = limit - TITLE_H - BOTTOM_PAD
 
 	-- Keep the held card where it was: pick the scroll, plus a gap above or below the list if needed.
@@ -3117,6 +4416,19 @@ function Guard.layoutBody()
 	local contentHeight = natural + topGap + bottomGap
 	-- Fixed (the default): always as tall as set with the grip, so the window never changes size; longer lists scroll.
 	local visible = holdVisible or (not db.autoGrow and room) or math.min(contentHeight, room)
+	-- The empty window's text (and the demo offer) sit a little way down; a window that grows with its drops is
+	-- tall enough to hold them, and a short fixed one moves them up, so they never spill out.
+	local block = History.emptyBlockH()
+	if #ordered == 0 and histH == 0 then
+		if db.autoGrow then
+			visible = math.min(room, math.max(visible, block + 50))
+		end
+		local top = math.max(5, math.min(40, math.floor((visible - block - 10) / 2)))
+		if main.emptyTop ~= top then
+			main.emptyTop = top
+			main.empty:SetPoint("TOP", scroll, "TOP", 0, -top)
+		end
+	end
 	local scrolls = contentHeight > visible + 0.5
 	if heldFromTop and scrollReserved ~= nil then
 		scrolls = scrollReserved -- keep the list's width while a drop is held (the scrollbar would shift it)
@@ -3125,9 +4437,11 @@ function Guard.layoutBody()
 	-- Layout runs every frame while a height animates: each size is set only when it changed. (The window's
 	-- height is compared with its live height, so a resize by the grip is never missed.)
 	local sized = false
-	local contentW = WIDTH - 2 * SIDE_PAD - (scrolls and scrollBar and SCROLLBAR_W or 0)
+	-- The rows never change width, so nothing shifts when the scrollbar appears (roll buttons included):
+	-- the scrollbar sits in the window's right padding, not in the rows' room.
+	local contentW = WIDTH - 2 * SIDE_PAD
 	if content.laidW ~= contentW then
-		scroll:SetPoint("BOTTOMRIGHT", -(SIDE_PAD + (scrolls and scrollBar and SCROLLBAR_W or 0)), BOTTOM_PAD)
+		scroll:SetPoint("BOTTOMRIGHT", -SIDE_PAD, BOTTOM_PAD)
 	end
 	if content.laidW ~= contentW or content.laidH ~= contentHeight then
 		content.laidW, content.laidH, sized = contentW, contentHeight, true
@@ -3144,19 +4458,27 @@ function Guard.layoutBody()
 	end
 	local isEmpty = #ordered == 0 and histH == 0
 	local demoLead = (History.demoLeadUntil and GetTime() < History.demoLeadUntil) and true or false
-	if main.emptyShown ~= isEmpty or (isEmpty and main.emptyLead ~= demoLead) then
-		main.emptyShown, main.emptyLead = isEmpty, demoLead
-		main.empty:SetText(demoLead and "Demo starting in a few seconds" or "No loot rolls yet")
-		main.emptyHint:SetText(demoLead and "" or "Group loot rolls appear here.")
+	local older = #History.records > 0
+	if main.emptyShown ~= isEmpty or (isEmpty and (main.emptyLead ~= demoLead or main.emptyOlder ~= older)) then
+		main.emptyShown, main.emptyLead, main.emptyOlder = isEmpty, demoLead, older
+		-- After a session of looting the list empties into History: say so, rather than "No loot rolls yet".
+		main.empty:SetText(demoLead and "Demo starting…" or (older and "No rolls in progress" or "No loot rolls yet"))
+		main.emptyHint:SetText(demoLead and "" or (older and "Older drops: History (the clock)." or "Group loot rolls appear here."))
 		main.empty:SetShown(isEmpty)
 		main.emptyHint:SetShown(isEmpty)
 	end
-	local demoOffer = isEmpty and not demoLead and History.canDemo()
-	if main.demoButton:IsShown() ~= demoOffer then
-		main.demoButton:SetShown(demoOffer)
-	end
-	if scrollBar then
-		scrollBar:SetShown(scrolls)
+	History.setDemoOffer(isEmpty and not demoLead and History.canDemo())
+	if scrollBar and scrollBar.wanted ~= scrolls then
+		scrollBar.wanted = scrolls
+		local from = scrollBar:IsShown() and History.shownAlpha(scrollBar) or 0
+		if scrolls then
+			scrollBar:Show()
+		end
+		History.fade(scrollBar, scrolls and 1 or 0, 0.25, function()
+			if not scrollBar.wanted then
+				scrollBar:Hide()
+			end
+		end, from)
 	end
 	if grip and gripPlacedFor ~= db.position then
 		gripPlacedFor = db.position
@@ -3212,17 +4534,18 @@ local function waitingOutOfView(card, top, view)
 	if not (card.layoutY and card.buttons:IsShown()) then
 		return nil
 	end
-	-- The roll buttons sit 4 to 24 px below the drop's top. At an edge the list can scroll past, a bar
-	-- covers 18 px, so buttons there count as out of view too; at an end of the list there's no bar.
-	if top > 0.5 and card.layoutY + 4 < top + MARKER_H then
+	-- At an edge the list can scroll past, a marker covers MARKER_H, so buttons there count as out of view;
+	-- at an end of the list there's no marker.
+	local look = card.look or Scale.look()
+	if top > 0.5 and card.layoutY - look.top < top + MARKER_H then
 		return "up"
-	elseif top + view < content:GetHeight() - 0.5 and card.layoutY + 24 > top + view - MARKER_H then
+	elseif top + view < content:GetHeight() - 0.5 and card.layoutY - look.top + look.size > top + view - MARKER_H then
 		return "down"
 	end
 end
 
 -- Whether the cursor is on the strip a marker covers (its edge of the list), shown or not.
-local function cursorOnStrip(up) -- (the strip at the top or bottom edge of the list)
+local function cursorOnStrip(up)
 	if not GetCursorPosition then
 		return false
 	end
@@ -3252,7 +4575,7 @@ local function watchStrips()
 				self:Hide()
 				requestMarkers()
 			end
-		end, 0.1)) -- (10 times a second)
+		end, 0.1))
 	end
 	markerWatch:Show()
 end
@@ -3263,8 +4586,6 @@ end
 local function setMarker(marker, count)
 	local now = GetTime()
 	local wantShown = count > 0
-	-- Held back while the cursor is on its strip. Hiding always waits for the cursor to leave (hiding
-	-- could uncover roll buttons under it); showing waits at most 3 s (a bar click only scrolls).
 	if wantShown ~= marker:IsShown() and cursorOnStrip(marker.up)
 		and (not wantShown or now - (marker.heldSince or now) < 3) then
 		if wantShown then
@@ -3296,7 +4617,7 @@ updateRollMarkers = function()
 		return
 	end
 	local above, below = 0, 0
-	if db.rollFromWindow and not Guard.fallback and main:IsShown() then
+	if History.rollsHere() and not Guard.fallback and main:IsShown() then
 		local top, view = scroll:GetVerticalScroll(), main:GetHeight() - TITLE_H - BOTTOM_PAD
 		local held = heldCard() -- the drop you're on is never "more to roll"
 		if held and waitingOutOfView(held, top, view) then
@@ -3352,7 +4673,7 @@ end
 ----------------------------------------------------------------------------------------------------
 
 local function suppressBlizzard()
-	if not (db.rollFromWindow and not Guard.fallback and main and main:IsShown()) then
+	if not (History.rollsHere() and not Guard.fallback and main and main:IsShown()) then
 		return false
 	end
 	-- Safety net: while Blizzard shows a roll RollFrames doesn't have (one left open across a /reload, or
@@ -3391,9 +4712,10 @@ function Guard.fail(err, where)
 	if GroupLootContainer then
 		pcall(GroupLootContainer.Show, GroupLootContainer)
 	end
-	if db and db.rollFromWindow then -- (without roll buttons in the window nothing changes for you: diag has it)
-		pcall(say, "switched back to Blizzard's standard roll frames for this session because of a problem. "
-			.. "Type /reload to try RollFrames again.")
+	pcall(History.updateStrata) -- (Blizzard's popups have the roll now: back to the normal layer)
+	if db and History.rollsHere() then -- (without roll buttons in the window nothing changes for you: diag has it)
+		pcall(say, "something went wrong, so for now you roll in Blizzard's roll popups. /reload to roll from this "
+			.. "window again (/rollframes diag has details for a bug report).")
 	end
 	Guard.note(where or "rolls", err)
 	pcall(function()
@@ -3450,7 +4772,7 @@ log = function(kind, fields)
 	end
 end
 
--- R38 pairing data (roll starts and each drop's first loot-history entry) also go to a separate, small
+-- Twins pairing data (roll starts and each drop's first loot-history entry) also go to a separate, small
 -- log, so a raid's many roll updates don't push them out of the main log before they're looked at.
 local PAIR_LOG_MAX = 200
 local function logPairing(kind, fields)
@@ -3491,7 +4813,7 @@ local function findPendingByItem(link, forRoll)
 		return nil -- an unreadable link never pairs with another
 	end
 	-- Same item and suffix first; then the same item ID, in case a roll's link and its loot-history link
-	-- ever describe the suffix differently (not seen yet; the dev log's item strings will tell).
+	-- describe the suffix differently.
 	-- A drop that settled as "Roll ended" (History.settleEnded) only takes a loot-history entry when no other
 	-- drop of that item is waiting (its own late result), never ahead of a live drop of the same item.
 	for pass = 1, forRoll and 2 or 4 do
@@ -3572,7 +4894,7 @@ clearDemoCards = function()
 	end
 end
 
--- Logs only (R38): the item part of a link ("item:id:enchant:...:bonus"), so the log shows whether two
+-- Logs only (twins): the item part of a link ("item:id:enchant:...:bonus"), so the log shows whether two
 -- copies of the same item can be told apart. Item strings carry no names.
 local function itemStringForLog(link)
 	if not link or isSecret(link) then
@@ -3582,7 +4904,7 @@ local function itemStringForLog(link)
 end
 
 -- Logs only: how many cards for this item are waiting for their loot-history entry (more than one means
--- the pairing is a guess, R38).
+-- the pairing is a guess).
 local function waitingForItemForLog(link)
 	local key, n = itemKeyFromLink(link), 0
 	for _, c in ipairs(cards) do
@@ -3644,7 +4966,7 @@ local function applyDropInfo(encounterID, lootListKey, info, opts)
 		showWindow()
 	end
 	if isNewCard then
-		-- Drops already decided when first seen (for example after a reload) appear collapsed.
+		-- Already decided when first seen: appears collapsed.
 		card = createCard(link, { instant = info.winner ~= nil or info.allPassed, demo = opts and opts.demo,
 			reserve = info.rollInfos and #info.rollInfos })
 		if card.demo then
@@ -3657,7 +4979,7 @@ local function applyDropInfo(encounterID, lootListKey, info, opts)
 	card.dropMark = mark
 	cardsByHistory[historyKey] = card
 	if card.encounterID ~= encounterID then
-		-- Trash drops all come under encounter 0; each boss has its own (checked on a real 5-man, 2026-11-08).
+		-- Trash drops all come under encounter 0.
 		card.encounterID = encounterID
 		card.isTrash = encounterID == 0
 		card.bossName = false
@@ -3668,7 +4990,7 @@ local function applyDropInfo(encounterID, lootListKey, info, opts)
 	end
 	setItem(card, link)
 	if not card.rollID and info.startTime and info.duration and not card.endsAt then
-		-- Units not yet confirmed on Forever; logged below.
+		-- Units (ms or s) unconfirmed on Forever: guessed by size; logged below.
 		local duration = info.duration > 1000 and info.duration / 1000 or info.duration
 		card.duration = duration
 		card.endsAt = GetTime() + duration
@@ -3700,7 +5022,7 @@ local function applyDropInfo(encounterID, lootListKey, info, opts)
 		winner = info.winner ~= nil, allPassed = info.allPassed, isTied = info.isTied,
 		startTime = info.startTime, duration = info.duration, historyTime = C_LootHistory.GetLootHistoryTime(),
 		rolls = table.concat(logRolls, " "), newCard = isNewCard,
-		-- R38 data, on a drop's first entry: its item string, the roll it was paired with, your click.
+		-- Twins data, on a drop's first entry: its item string, the roll it was paired with, your click.
 		item = firstEntry and itemStringForLog(link) or nil, pairedRollID = firstEntry and card.rollID or nil,
 		clicked = firstEntry and card.clickedState or nil, waitingSameItem = waitingBefore
 	}) end
@@ -3708,12 +5030,12 @@ local function applyDropInfo(encounterID, lootListKey, info, opts)
 	if card.rollEnded and (info.winner or info.allPassed) then
 		local w = info.winner
 		History.lateResult(card, w and { name = safe(w.playerName, "?"), class = safe(w.playerClass), roll = safe(w.roll),
-			state = safe(w.state) } or nil, info.allPassed and not w)
+			state = safe(w.state), isSelf = safe(w.isSelf) == true } or nil, info.allPassed and not w)
 	elseif info.winner and not card.finished then
 		local w = info.winner
 		local name = safe(w.playerName, "?")
 		setWinner(card, safe(w.playerGUID) or name,
-			{ name = name, class = safe(w.playerClass), roll = safe(w.roll), state = safe(w.state) })
+			{ name = name, class = safe(w.playerClass), roll = safe(w.roll), state = safe(w.state), isSelf = safe(w.isSelf) == true })
 	elseif info.allPassed and not card.finished then
 		setAllPassed(card)
 	end
@@ -3758,7 +5080,7 @@ local function onStartRoll(rollID, rollTime, ...)
 	card.rollTime = rollTime
 	card.rollStarted = GetTime()
 	cardsByRollID[rollID] = card
-	if not card.twins then -- another copy of this item started at the same moment: twins (R38)
+	if not card.twins then -- another copy of this item started at the same moment: twins
 		local key = itemKeyFromLink(link) -- (the card's own itemKey is set by setItem, further down)
 		for _, other in ipairs(cards) do
 			if key and other ~= card and other.rollID and other.rollStarted and not other.finished and not other.demo
@@ -3775,7 +5097,7 @@ local function onStartRoll(rollID, rollTime, ...)
 	card.timer:Show()
 	refreshButtons(card)
 	if logging() then
-		-- R38 data: anything else the event carries (a loot handle could match the history's lootListKey),
+		-- Twins data: anything else the event carries (a loot handle could match the history's lootListKey),
 		-- the item string, and how many cards for the same item are still waiting for their history.
 		local extra = {}
 		for i = 1, select("#", ...) do
@@ -3841,13 +5163,10 @@ function Guard.adoptRolls()
 	end
 end
 
--- Watchdog (user, 2026-11-10): a roll waiting for you while Blizzard's popups are hidden must have its drop
--- in the window, placed, with roll buttons. It runs on a frame of its own (not the animation driver or the
--- once-a-second ticker, which an error could stop) and is never trigger-happy: a roll is first looked at
--- only after 3 s of real time AND 5 drawn frames since it started (so a loading screen, a freeze or 4 fps
--- can't trip it), only while it's still open, and a problem gets one rebuild and a second look a second
--- later. Only then do Blizzard's popups come back for the session (Guard.fail). Rolls that are fine are
--- looked at again once a second until they end.
+-- Watchdog: a roll waiting for you while Blizzard's popups are hidden must have its drop placed, with
+-- roll buttons. Own frame (an error could stop the driver or ticker). First look after 3 s AND 5 drawn
+-- frames (loading screens, freezes, low fps); a problem gets one rebuild and a second look a second later,
+-- then Blizzard's popups come back for the session (Guard.fail). Fine rolls are rechecked once a second.
 Guard.watched = {} -- roll ID (dev builds: also a demo card) -> { at, frame, rebuilt, gen }
 Guard.frameNo, Guard.nextLook = 0, 0 -- frames drawn while watching; seconds until the list is next looked at
 function Guard.watch(subject)
@@ -3896,7 +5215,7 @@ function Guard.rollState(subject, w)
 	if type(subject) == "table" then -- a demo drop (dev builds)
 		local card = subject
 		if card.gen ~= w.gen or not card.demoWaitsForYou or card.youRolled or card.finished
-			or GetTime() >= (card.endsAt or 0) or not db.rollFromWindow or not main:IsShown() then
+			or GetTime() >= (card.endsAt or 0) or not History.rollsHere() or not main:IsShown() then
 			return "done"
 		end
 		return Guard.cardReady(card)
@@ -4017,7 +5336,7 @@ local function onCancelRoll(rollID)
 	confirmedRolls[rollID] = nil
 	rolledIDs[rollID] = nil
 	Guard.watched[rollID] = nil -- (the roll is over for you: nothing left to watch, and nothing to rebuild)
-	if logging() then -- (does this also fire right after your own roll? R38 in-game check)
+	if logging() then
 		local fields = { rollID = rollID, hadCard = card ~= nil, clicked = card and card.clickedState or nil,
 			reported = card and card.selfReported or nil }
 		log("cancel", fields)
@@ -4036,7 +5355,8 @@ local DEMO_PLAYERS = {
 }
 -- Two boss drops and one from trash, so boss names and "Keep trash drops" can be tried solo.
 local DEMO_ITEMS = {
-	{ name = "Demo Blade of Testing", icon = "Interface\\Icons\\INV_Sword_04", quality = 3, boss = "Demo Boss" },
+	{ name = "Demo Blade of Testing", icon = "Interface\\Icons\\INV_Sword_04", quality = 3, boss = "Demo Boss",
+		topRoll = true }, -- (its winner rolls 100, so the widest roll shows in the demo)
 	{ name = "Demo Chain Hauberk", icon = "Interface\\Icons\\INV_Chest_Chain_05", quality = 4, boss = "Demo Boss" },
 	{ name = "Demo Grey Gloves", icon = "Interface\\Icons\\INV_Gauntlets_04", quality = 2, allPass = true },
 	-- More for /rollframes demo <count>: a mix of boss and trash drops, qualities and an all-pass.
@@ -4068,19 +5388,23 @@ end
 -- round, as can happen in a raid). Returns the card.
 local function runDemoItem(item, opts)
 	local card = createCard(nil, { demo = true, reserve = #DEMO_PLAYERS })
-	card.demoRoll = opts and opts.ownRoll or {} -- the made-up roll the buttons use (a click sets .choice)
+	card.demoRoll = opts and opts.ownRoll or {} -- a click sets .choice
 	local mine = opts and opts.simRoll or card.demoRoll
 	local gen = card.gen -- the demo's timers stop if the card is cleared and reused meanwhile
 	demoCardCount = demoCardCount + 1
 	card.isTrash, card.bossName = not item.boss, item.boss or false
-	setItem(card, nil, item.name, item.icon, item.quality)
+	if item.link then -- (a real item: its name, icon and quality come from the link)
+		setItem(card, item.link)
+	else
+		setItem(card, nil, item.name, item.icon, item.quality)
+	end
 	card.duration = 12
 	card.endsAt = GetTime() + card.duration
 	card.timer:Show()
 	card.demoWaitsForYou = true
 	refreshButtons(card)
 	if DEV then
-		Guard.watch(card) -- (dev builds watch the demo too, so /rollframes fail watchdog can be tried solo)
+		Guard.watch(card) -- so /rollframes fail watchdog can be tried solo
 	end
 
 	local players = shuffled(DEMO_PLAYERS)
@@ -4093,14 +5417,30 @@ local function runDemoItem(item, opts)
 
 	local function revealAndPickWinner()
 		local delay = 0
+		local top -- (topRoll: the roll that will win gets 100: a Need if any, else a Greed)
+		if item.topRoll then
+			for _, r in ipairs(rolls) do
+				if not top and (r.state == STATE.NEED or r.state == STATE.NEED_OFF) then top = r end
+			end
+			for _, r in ipairs(rolls) do
+				if not top and r.state == STATE.GREED then top = r end
+			end
+		end
+		-- As the game does: when anyone needs, only the Need choices roll (Greed and Transmog get no number).
+		local needed = false
 		for _, r in ipairs(rolls) do
-			if r.state ~= STATE.PASS and r.state ~= STATE.NOROLL then
+			if r.state == STATE.NEED or r.state == STATE.NEED_OFF then needed = true end
+		end
+		for _, r in ipairs(rolls) do
+			local getsRoll = r.state ~= STATE.PASS and r.state ~= STATE.NOROLL
+				and (not needed or r.state == STATE.NEED or r.state == STATE.NEED_OFF)
+			if getsRoll then
 				delay = delay + 0.35
 				C_Timer.After(delay, Guard.wrap("demo", function()
 					if card.gen ~= gen then
 						return
 					end
-					r.roll = math.random(1, 100)
+					r.roll = r == top and 100 or math.random(1, 99)
 					applyRolls(card, rolls)
 				end))
 			end
@@ -4111,7 +5451,7 @@ local function runDemoItem(item, opts)
 			end
 			local best, bestRank
 			for _, r in ipairs(rolls) do
-				if r.state ~= STATE.PASS and r.state ~= STATE.NOROLL then
+				if r.roll and r.state ~= STATE.PASS and r.state ~= STATE.NOROLL then
 					local rank = (r.state == STATE.NEED or r.state == STATE.NEED_OFF) and 2 or 1
 					if not best or rank > bestRank or (rank == bestRank and r.roll > best.roll) then
 						best, bestRank = r, rank
@@ -4120,7 +5460,7 @@ local function runDemoItem(item, opts)
 			end
 			if best then
 				setWinner(card, best.playerGUID,
-					{ name = best.playerName, class = best.playerClass, roll = best.roll, state = best.state })
+					{ name = best.playerName, class = best.playerClass, roll = best.roll, state = best.state, isSelf = best.isSelf })
 			else
 				setAllPassed(card)
 			end
@@ -4129,16 +5469,15 @@ local function runDemoItem(item, opts)
 
 	local delay = 0.4
 	local remaining = #rolls
-	-- With "Roll from this window" on, "You" waits for your click like a real roll (checked a few times a
-	-- second), and passes if the timer runs out, as the game does.
-	local waitsForYou = db.rollFromWindow
+	-- Rolling here, "You" waits for the click (polled) and passes when the timer runs out, as the game does.
+	local waitsForYou = History.rollsHere()
 	for _, r in ipairs(rolls) do
 		delay = delay + 0.5 + math.random() * 0.8
 		local function takeTurn()
 			if card.gen ~= gen then
 				return
 			end
-			if r.isSelf and (waitsForYou or db.rollFromWindow) and not mine.choice and GetTime() < card.endsAt then
+			if r.isSelf and (waitsForYou or History.rollsHere()) and not mine.choice and GetTime() < card.endsAt then
 				C_Timer.After(0.25, Guard.wrap("demo", takeTurn))
 				return
 			end
@@ -4147,7 +5486,7 @@ local function runDemoItem(item, opts)
 				state = CLICK_STATE[mine.choice]
 			elseif item.allPass then
 				state = STATE.PASS
-			elseif r.isSelf and (waitsForYou or db.rollFromWindow) then
+			elseif r.isSelf and (waitsForYou or History.rollsHere()) then
 				state = STATE.PASS -- the timer ran out
 			else
 				local x = math.random()
@@ -4171,25 +5510,75 @@ local function runDemoItem(item, opts)
 	return card
 end
 
--- No demo in a group: real loot can arrive at any moment there, and demo drops would sit where real
--- ones appear. (Group loot rolls only exist in a group, so solo the demo can't meet real loot.) Dev
--- builds still allow it, for testing.
+-- Solo only: in a group, real loot can arrive any moment and land among demo drops.
 local function demoBlocked()
 	if IsInGroup() and not DEV then
-		say("the demo only runs outside a group (real loot can arrive any moment).")
+		say("the demo only runs when you're not in a group (real loot could arrive at any moment).")
 		return true
 	end
 	return false
 end
 
--- count: how many made-up drops (default 3, up to 20); more than the list repeats it. With more than three
--- they come every 2 seconds, so the list fills up and scrolls.
--- The empty window's "Try the demo" button: only solo (in a group the demo is blocked: real loot may come).
 function History.canDemo()
 	return DEV or not IsInGroup()
 end
 
-local function runDemo(count)
+-- A retire fade already under way finishes on its own.
+function History.setDemoOffer(on)
+	on = on and not db.demoHidden and true or false
+	if History.demoOfferWanted == on or History.demoRetiring then
+		return
+	end
+	History.demoOfferWanted = on
+	local parts = { main.demoButton, main.demoHide }
+	if History.noFlash() or not main:IsVisible() then
+		for _, part in ipairs(parts) do
+			History.setAlpha(part, 1)
+			part:SetShown(on)
+		end
+		return
+	end
+	for i, part in ipairs(parts) do
+		part:Show()
+		History.fade(part, on and 1 or 0, 0.25, i == 1 and function()
+			for _, each in ipairs(parts) do
+				History.setAlpha(each, 1)
+				each:SetShown(History.demoOfferWanted)
+			end
+		end or nil, on and 0 or 1)
+	end
+end
+
+-- "Don't show this again": db is account-wide, so it's gone on every character; the chat line keeps
+-- /rollframes demo findable.
+function History.retireDemoOffer()
+	if db.demoHidden then
+		return
+	end
+	db.demoHidden = true
+	History.demoOfferWanted = false
+	GameTooltip_Hide()
+	local parts = { main.demoButton, main.demoHide }
+	local function gone()
+		History.demoRetiring = nil
+		for _, part in ipairs(parts) do
+			part:Hide()
+			History.setAlpha(part, 1)
+		end
+	end
+	if History.noFlash() then
+		gone()
+	else
+		History.demoRetiring = true
+		for i, part in ipairs(parts) do
+			History.fade(part, 0, 0.3, i == 1 and gone or nil, History.shownAlpha(part))
+		end
+	end
+	say("demo button hidden on all your characters. Try it any time with /rollframes demo.")
+end
+
+-- items: what the drops are (default DEMO_ITEMS); dev builds can pass real ones (/rollframes demo real).
+local function runDemo(count, items)
 	if demoBlocked() then
 		return
 	end
@@ -4198,8 +5587,7 @@ local function runDemo(count)
 	clearDemoCards() -- (also ends a demo still playing)
 	local run = demoRun
 	showWindow()
-	-- Something to see in History (only when you have no real history yet; demo records leave with the demo),
-	-- and 5 seconds before the first drop, to open History and watch new loot bring you back.
+	-- Sample History records, only when there's none yet; they leave with the demo.
 	if #History.records == 0 then
 		for i = 4, 1, -1 do
 			local item = DEMO_ITEMS[#DEMO_ITEMS - i + 1]
@@ -4214,29 +5602,85 @@ local function runDemo(count)
 	if History.shown then
 		layout()
 	end
-	local lead = 2 -- (a short pause, so the window is seen opening first; user, 2026-11-10: was 5)
+	History.demoLeft = count -- (drops still to come; History.checkDemoDone)
+	local lead = 2 -- (a short pause, so the window is seen opening first)
 	History.demoActive = true -- (the X stops the demo while it's on; see History.askClear)
 	History.demoLeadUntil = GetTime() + lead
 	layout() -- (the empty text says the demo is starting)
 	for i = 1, count do
-		local item = DEMO_ITEMS[(i - 1) % #DEMO_ITEMS + 1]
+		local list = items and #items > 0 and items or DEMO_ITEMS
+		local item = list[(i - 1) % #list + 1]
 		C_Timer.After(lead + (i - 1) * gap, function()
 			if run == demoRun then
+				History.demoLeft = math.max(0, (History.demoLeft or 1) - 1)
 				Guard.call("demo", runDemoItem, item)
 			end
 		end)
 	end
-	-- No timer to clear them: like real drops they stay as history rows, and they go when the window
-	-- closes (or fades out), when real loot arrives, or when another demo starts.
 	local last = lead + (count - 1) * gap
-	say(string.format("demo: %d made-up drop%s over about %d seconds. They go when the window closes.",
-		count, count == 1 and "" or "s", math.floor(last + 20)))
+	local drops = count .. (items and #items > 0 and " drop" or " made-up drop") .. (count == 1 and "" or "s")
+		.. (items and #items > 0 and " with items from your History" or "")
+	if History.rollsHere() then
+		say("demo: " .. drops .. "; roll on them like real loot (nothing is really rolled). They fade out a little "
+			.. "after the last one.")
+	else
+		say(string.format("demo: %s over about %d seconds. They fade out a little after the last one.", drops,
+			math.floor((last + 10) / 5 + 0.5) * 5))
+	end
+end
+
+-- Once every demo drop has come and been decided, its rows and records go a little later, so the demo
+-- never sits among real loot (a pinned window never closes).
+History.DEMO_LINGER = 15 -- seconds
+function History.checkDemoDone()
+	if (History.demoLeft or 0) > 0 then
+		return
+	end
+	for _, card in ipairs(cards) do
+		if card.demo and not card.finished and not card.dismissing then
+			return
+		end
+	end
+	local run = demoRun
+	local function later()
+		if run ~= demoRun or not (main and main:IsShown()) then
+			return -- (cleared, another demo started, or the window closed: closing clears them)
+		end
+		if not pinned and (tonumber(db.autoHide) or 0) > 0 then
+			return -- (a window that fades out by itself takes the demo with it, never showing an empty list first)
+		end
+		if main:IsMouseOver() then
+			C_Timer.After(2, later) -- (never under the mouse: the player may be reading them)
+			return
+		end
+		Guard.call("demo", History.endDemo)
+	end
+	C_Timer.After(History.DEMO_LINGER, later)
+end
+
+function History.endDemo()
+	History.demoLeft = nil
+	History.demoActive = nil
+	local demo = {}
+	for _, card in ipairs(cards) do
+		if card.demo and not card.dismissing then
+			demo[#demo + 1] = card
+		end
+	end
+	for _, card in ipairs(demo) do -- (dismissing can change the list at once: a hidden window)
+		dismissCard(card, "demo over")
+	end
+	if #History.demo > 0 then
+		wipe(History.demo)
+		relayoutPending = true
+		driver:Show()
+	end
 end
 
 -- The empty window's "Try the demo" button: three made-up drops (same as /rollframes demo).
 function History.startDemo()
 	if Guard.off.demo then
-		say("the demo is off until you /reload (it hit a problem).")
+		say("the demo hit a problem and is off until you /reload.")
 		return
 	end
 	Guard.call("demo", runDemo, 3)
@@ -4248,6 +5692,7 @@ Guard.stops.highlight = function()
 	for card in pairs(Highlight.cards) do
 		local hl = card.hl
 		if hl then
+			pcall(Highlight.still, hl)
 			pcall(hl.Hide, hl)
 			if hl.bar then
 				pcall(hl.bar.Hide, hl.bar)
@@ -4256,15 +5701,9 @@ Guard.stops.highlight = function()
 	end
 	wipe(Highlight.cards)
 	Highlight.count = 0
-	if Highlight.driver then
-		Highlight.driver:Hide()
-	end
 end
 Guard.stops.flash = function()
-	tweens["main:flash"] = nil
-	if History.flash then
-		History.flash:Hide()
-	end
+	History.endFlash()
 end
 Guard.stops.markers = function()
 	main.markerUp:Hide()
@@ -4279,6 +5718,7 @@ Guard.stops.guard = function()
 		if card.guarded then
 			card.guarded = nil
 			pcall(card.buttons.SetAlpha, card.buttons, 1)
+			pcall(Scale.refreshGlow, card)
 		end
 	end
 	if History.guardWatch then
@@ -4301,9 +5741,11 @@ Guard.stops.autohide = function()
 end
 Guard.stops.chrome = function()
 	main.chromeWatch:Hide()
-	tweens["main:chrome"] = nil
+	if grip then
+		History.setAlpha(grip, 1) -- (its fades ran from the chrome watch)
+	end
 	for _, region in pairs({ main.NineSlice, main.Bg }) do
-		region:SetAlpha(1)
+		History.setAlpha(region, 1)
 	end
 end
 Guard.stops.timer = function()
@@ -4313,13 +5755,13 @@ Guard.stops.timer = function()
 end
 Guard.stops.resize = function()
 	grip:SetScript("OnUpdate", nil)
+	grip:UnlockHighlight()
 end
 
 ----------------------------------------------------------------------------------------------------
 -- Auto-hide
 ----------------------------------------------------------------------------------------------------
 
--- Whether the window may fade now: shown, not pinned, auto-hide on, not already fading, every drop decided.
 fadeEligible = function()
 	if not main or not main:IsShown() or pinned or db.autoHide <= 0 or tweens["main:fade"] or askShown
 		or Guard.off.autohide then
@@ -4367,12 +5809,10 @@ refreshPin = function()
 		return
 	end
 	main.pin:SetShown(db.autoHide > 0)
-	if main.hist then
-		main.hist:ClearAllPoints()
-		main.hist:SetPoint("RIGHT", db.autoHide > 0 and main.pin or main.closeButton or main.pin, "LEFT", -18, 0)
-	end
+	History.placeClock()
 	local transient = not pinned and db.autoHide > 0 -- this window may fade by itself
-	main.chromeWatch:SetShown(transient)
+	main.chromeTransient = transient
+	main.chromeWatch:Show() -- (also shows the resize corner on hover; a child: stops with the window)
 	main.setChrome(transient and not (main:IsShown() and main:IsMouseOver()) and CHROME_IDLE_ALPHA or 1)
 	-- Same shape both ways; the colour carries the state: gold = stays open, grey = fades when idle.
 	main.pin.icon:SetDesaturated(true)
@@ -4392,10 +5832,8 @@ end
 -- view reuses one row frame per visible line, so memory stays flat however long the night is.
 ----------------------------------------------------------------------------------------------------
 
--- A drop just collapsed into a history row: keep what the row shows. Real records are saved per character
--- (RollFramesHistory) and matched by the drop's mark, so the same drop seen again after a reload isn't added
--- twice. History.cardOf remembers each record's card (not saved: cards are frames), so while that card is
--- still in the list as a row, History doesn't show the drop twice.
+-- Real records are saved per character and matched by drop mark, so a drop replayed after a reload isn't
+-- added twice. cardOf (not saved: cards are frames) keeps History from repeating a drop still in the list.
 function History.record(card)
 	local mark = not card.demo and card.dropMark or nil
 	-- A drop's identity: its loot-history key plus its mark (two identical items dropped together share the
@@ -4409,7 +5847,9 @@ function History.record(card)
 	History.seq = History.seq + 1
 	local rec = {
 		seq = History.seq, link = card.link, name = card.itemName, quality = card.quality, demo = card.demo,
-		icon = card.icon.tex:GetTexture(), ilvl = card.ilvl:GetText(), winner = card.winnerText:GetText(),
+		-- (true: your win, kept tinted; false: someone else's, so cleanRecord's backfill skips it; nil: no winner yet)
+		mine = History.mineOf(card.winner),
+		icon = card.icon.tex:GetTexture(), ilvl = card.ilvl:GetText(), winner = card.winnerFull,
 		atlas = card.allPassed and STATE_ATLAS[STATE.PASS]
 			or (card.winner and (STATE_ATLAS[card.winner.state] or STATE_ATLAS[STATE.GREED])) or nil,
 		boss = card.bossName or nil, when = time and time() or nil, at = date("%H:%M"),
@@ -4424,12 +5864,11 @@ function History.record(card)
 	History.trimRecords()
 end
 
--- Window heights in whole-row steps (user, 2026-11-10): whole compact rows, plus room for the "more to roll"
--- bar below the last one (when nothing is waiting there, the next row's name peeks out instead). 38 per row
--- (a 34 px row and its 4 px gap) plus 56 (title bar 28, bottom padding 10, the bar 18): 2 rows 132, 7 rows
--- 322, 8 rows 360. Nearest step; down: the step at or below h, for a limit that mustn't be passed.
+-- Heights where the list ends exactly at a row's bottom edge, for the current row height (it grows with the
+-- roll buttons): n rows and the n - 1 gaps between them. Two rows is the window's minimum (MIN_HEIGHT).
+-- Nearest step; down: the step at or below h, for a limit.
 function History.snapHeight(h, down)
-	local step, base = HEADER_H + CARD_GAP, TITLE_H + BOTTOM_PAD + MARKER_H
+	local step, base = HEADER_H + CARD_GAP, TITLE_H + BOTTOM_PAD - CARD_GAP
 	local n = (h - base) / step
 	n = down and math.floor(n + 1e-6) or math.floor(n + 0.5)
 	return math.max(2, n) * step + base
@@ -4439,10 +5878,7 @@ end
 function History.wideTimer(card)
 	if card.timerThin then
 		card.timerThin = nil
-		card.timer:ClearAllPoints()
-		card.timer:SetPoint("BOTTOMLEFT", card.icon, "BOTTOMRIGHT", 6, 1)
-		card.timer:SetPoint("RIGHT", card.frame, "RIGHT", -6, 0)
-		card.timer:SetHeight(4)
+		Scale.placeTimer(card)
 	end
 	card.summaryPlaced = nil
 end
@@ -4459,32 +5895,93 @@ function History.fitBoss(boss, winner, taken)
 	if line <= 0 then
 		line = WIDTH - 2 * SIDE_PAD
 	end
-	line = line - (3 + ICON + 24) - 6 - taken -- (from the winner's left edge to the row's right padding)
+	line = line - (3 + Scale.iconSize + 24) - 6 - taken -- (from the winner's left edge to the row's right padding)
 	local bossW = boss.GetUnboundedStringWidth and boss:GetUnboundedStringWidth() or 110
 	local winnerW = winner.GetUnboundedStringWidth and winner:GetUnboundedStringWidth() or 0
 	boss:SetWidth(math.max(50, math.min(bossW + 2, line - winnerW - 6)))
 end
 
--- Item and roll tooltips open beside the window, on the side with more screen room and level with the row
--- the mouse is on, instead of at the mouse over the list (user, 2026-11-10). row: the drop or History row
--- to line up with. If the positions can't be read, it opens beside the row as before.
-function History.tooltipBeside(owner, row)
-	GameTooltip:SetOwner(owner, "ANCHOR_NONE")
+-- Tooltips open beside the window, on the side with more screen room, level with row (a drop, a History row,
+-- the empty window's buttons). They hang from a small point on the row, out at the window's edge, with a corner anchor type: the
+-- game's comparison tooltips follow the anchor type (further out on that side), and when they don't fit, the
+-- game's slide moves the tooltip sideways only (with offsets from the hovered frame, it dropped them and jumped
+-- onto the window). "Tooltips at game's spot": the game's own place instead. History.tipFor: what it's for.
+function History.tooltipBeside(forFrame, row)
+	History.tipFor = forFrame
+	if db.tooltipGameSpot and GameTooltip_SetDefaultAnchor then
+		GameTooltip_SetDefaultAnchor(GameTooltip, forFrame)
+		return
+	end
 	local placed = pcall(function()
-		local ms = main:GetEffectiveScale()
+		local point = History.tipPoint
+		if not point then
+			point = CreateFrame("Frame", nil, main)
+			point:SetSize(1, 1)
+			-- The tooltip's owner is this point, so it doesn't hide with the frame it's for: hide it then.
+			point:SetScript("OnUpdate", function(self)
+				if not GameTooltip:IsShown() or not GameTooltip:IsOwned(self) then
+					self:Hide() -- (closed, or another tooltip took over: nothing to watch)
+				elseif History.tipFor and not History.tipFor:IsVisible() then
+					GameTooltip:Hide()
+					self:Hide()
+				end
+			end)
+			History.tipPoint = point
+		end
+		local ms, rs = main:GetEffectiveScale(), row:GetEffectiveScale()
 		local screen = UIParent:GetRight() * UIParent:GetEffectiveScale()
 		local roomLeft, roomRight = main:GetLeft() * ms, screen - main:GetRight() * ms
-		-- (offsets are in the tooltip's own scale: someone may have scaled it)
-		local dy = (row:GetTop() * row:GetEffectiveScale() - main:GetTop() * ms) / GameTooltip:GetEffectiveScale()
-		GameTooltip:ClearAllPoints()
+		-- Hung from the row (so it follows the row when the list moves), out at the window's edge.
+		point:ClearAllPoints()
 		if roomRight >= roomLeft then
-			GameTooltip:SetPoint("TOPLEFT", main, "TOPRIGHT", 2, dy)
+			point:SetPoint("BOTTOMRIGHT", row, "TOPRIGHT", (main:GetRight() * ms - row:GetRight() * rs) / rs + 2, 0)
+			GameTooltip:SetOwner(point, "ANCHOR_BOTTOMRIGHT")
 		else
-			GameTooltip:SetPoint("TOPRIGHT", main, "TOPLEFT", -2, dy)
+			point:SetPoint("BOTTOMLEFT", row, "TOPLEFT", (main:GetLeft() * ms - row:GetLeft() * rs) / rs - 2, 0)
+			GameTooltip:SetOwner(point, "ANCHOR_BOTTOMLEFT")
 		end
+		point:Show() -- (its watch runs only while its tooltip shows)
 	end)
 	if not placed then
-		GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+		GameTooltip:SetOwner(forFrame, "ANCHOR_RIGHT")
+	end
+end
+
+-- The small tip by the roll button under the mouse (Blizzard's roll popup has one): the roll's name, why it
+-- can't be chosen, or Click guard. Its own tooltip (Blizzard's template), so the item tooltip can stay up.
+-- "Roll button tooltips" off: none.
+function History.showButtonTip(button, card, spec)
+	if not db.buttonTips then
+		History.hideButtonTip()
+		return
+	end
+	local tip = History.buttonTip
+	if tip == nil then
+		local ok, made = pcall(CreateFrame, "GameTooltip", "RollFramesButtonTooltip", UIParent, "GameTooltipTemplate")
+		tip = ok and made or false -- (no template in this client: no tips)
+		History.buttonTip = tip
+	end
+	if not tip then
+		return
+	end
+	tip:SetOwner(button, "ANCHOR_RIGHT")
+	tip:SetText(spec.label, 1, 1, 1)
+	if not button:IsEnabled() then
+		tip:AddLine("You can't choose " .. spec.label .. " on this item.", 1, 0.13, 0.13, true)
+	elseif card.guarded then
+		tip:AddLine(History.guardLine(), 1, 0.82, 0.2, true)
+	end
+	tip:Show()
+end
+
+function History.guardLine()
+	return (tonumber(db.guardTime) or 2) > 0 and "The list just moved. Move the mouse, or wait a moment, to roll."
+		or "The list just moved. Move the mouse to roll."
+end
+
+function History.hideButtonTip()
+	if History.buttonTip then
+		History.buttonTip:Hide()
 	end
 end
 
@@ -4499,15 +5996,13 @@ function History.when(e)
 	return ok and type(text) == "string" and text or e.at or ""
 end
 
--- At login: this character's saved History, and the drops cleared before (so they don't come back from
--- Blizzard's loot history after a reload). The saved file is treated as untrusted: a game that crashed while
--- writing it may leave it unreadable (the game then gives us nothing) or odd. Every record is checked field
--- by field; anything malformed is dropped, the rest kept; if anything at all goes wrong, History starts
--- empty. History is a convenience: it must never break the window.
+-- Saved History is untrusted: a crash while writing can leave it unreadable (the game then gives us nil)
+-- or odd. Each record is checked field by field and malformed ones dropped; on any error History starts
+-- empty, never breaking the window.
 -- (On History, not top-level locals: the main chunk is at Lua's 200-local limit.)
 History.RECORD_FIELDS = { link = "string", name = "string", quality = "number", icon = "number|string",
 	ilvl = "string", winner = "string", atlas = "string", boss = "string", when = "number", at = "string",
-	key = "string", mark = "string" }
+	key = "string", mark = "string", mine = "boolean" }
 
 function History.cleanRecord(rec)
 	if type(rec) ~= "table" then
@@ -4535,15 +6030,30 @@ function History.cleanRecord(rec)
 			clean.winner = "|cffffd100" .. roll .. "|r  " .. name
 		end
 	end
+	-- No "mine" (older saves): decided once from the winner's name, then saved. The game's isSelf wins where known.
+	if (clean.mine == nil or (clean.mine == false and History.recheckMine)) and clean.winner then
+		local me = History.myName
+		if me == nil then
+			local ok, name = pcall(UnitName, "player")
+			me = ok and type(name) == "string" and not isSecret(name) and name ~= "" and name or false
+			History.myName = me
+		end
+		if me then
+			-- Winner text is "<roll>  <name>": the name may have two parts here (first and last), and UnitName may
+			-- give only the first.
+			local plain = clean.winner:gsub("|A.-|a", ""):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+			local name = plain:match("^%s*%d*%s*(.-)%s*$") or ""
+			clean.mine = name == me or name:sub(1, #me + 1) == me .. " "
+		end
+	end
 	return clean
 end
 
 function History.load()
-	-- Starting fresh, with one gentle chat line, when the saved file is lost or damaged: this character had saved
-	-- History (db.historySaved) but none came back (the game couldn't read the file), the file isn't the shape
-	-- we write, or more than a few records are broken. One or two bad records are just dropped.
+	-- Fresh start, with one chat line, when the file is lost (db.historySaved says this character had
+	-- History but none came back), the wrong shape, or more than a few records are broken.
 	local fresh = false
-	-- (db.historySaved is account-wide: it lists which characters have saved History, by character ID.)
+	-- (db.historySaved is account-wide: which characters, by GUID, have saved History.)
 	local me = UnitGUID and UnitGUID("player")
 	if RollFramesHistory == nil and me and type(db.historySaved) == "table" and db.historySaved[me] then
 		fresh = true
@@ -4553,6 +6063,8 @@ function History.load()
 			fresh = true
 		end
 		local saved = type(RollFramesHistory) == "table" and RollFramesHistory or {}
+		-- Name checks made before two-part names were handled are made again, once.
+		History.recheckMine = saved.mineCheck ~= 2
 		local records, bad = {}, 0
 		if saved.records ~= nil and type(saved.records) ~= "table" then
 			fresh = true
@@ -4587,11 +6099,11 @@ function History.load()
 		for i = math.max(1, #all - 999), #all do -- the newest 1000
 			gone[#gone + 1] = all[i]
 		end
-		RollFramesHistory = { records = records, gone = gone }
+		RollFramesHistory = { records = records, gone = gone, mineCheck = 2 }
 	end)
 	if not ok or fresh then
-		RollFramesHistory = { records = {}, gone = {} } -- start empty rather than break anything
-		say("your saved loot history couldn't be read, so History is starting fresh.")
+		RollFramesHistory = { records = {}, gone = {}, mineCheck = 2 } -- start empty rather than break anything
+		say("this character's saved History couldn't be read (the file may be damaged), so it starts empty.")
 	end
 	History.records = RollFramesHistory.records
 	wipe(History.byMark)
@@ -4691,17 +6203,20 @@ function History.toggle(on)
 	end
 	History.shown = on
 	main.hist.lit:SetShown(on)
-	main.clear:SetShown(on) -- the X only shows with History
+	main.clear:SetShown(on)
 	if not on then
 		History.hideRows()
 	end
 	History.rowAlpha = on and 0 or 1
+	History.ageing = nil
+	History.ageGen = (History.ageGen or 0) + 1 -- (an age-out under way is over)
 	layout()
 	if on then
-		tween("history:rows", 0.3, function(p)
-			History.rowAlpha = p
-			for _, row in ipairs(History.rows) do row.alpha = p; row:SetAlpha(p) end
-		end)
+		History.rowAlpha = 1
+		for _, row in ipairs(History.rows) do
+			row.alpha = 1
+			History.fade(row, 1, 0.3, nil, 0)
+		end
 	end
 end
 
@@ -4714,21 +6229,29 @@ end
 
 -- The older drops age out again after "Finished drops stay" without you touching the window (a fade).
 function History.ageOut()
-	tween("history:rows", 0.35, function(p)
-		History.rowAlpha = 1 - p
-		for _, row in ipairs(History.rows) do row.alpha = 1 - p; row:SetAlpha(1 - p) end
-	end, function()
+	History.ageing = true
+	History.ageGen = (History.ageGen or 0) + 1
+	local gen = History.ageGen
+	History.rowAlpha = 0
+	for _, row in ipairs(History.rows) do
+		row.alpha = 0
+		History.fade(row, 0, 0.35)
+	end
+	C_Timer.After(0.35, Guard.wrap("history", function()
+		if History.ageGen ~= gen then
+			return
+		end
+		History.ageing = nil
 		if main:IsMouseOver() then -- the mouse came in during the fade: keep them (nothing moves under it)
 			History.touch = GetTime()
 			History.rowAlpha = 1
-			for _, row in ipairs(History.rows) do row.alpha = 1; row:SetAlpha(1) end
+			for _, row in ipairs(History.rows) do row.alpha = 1; History.setAlpha(row, 1) end
 			return
 		end
 		History.toggle(false)
-	end)
+	end))
 end
 
--- The X: asks first (always, since the "Ask before clearing" setting went on 2026-11-10), then clears.
 function History.askClear()
 	if History.demoActive then
 		History.stopDemo() -- during a demo the X only ends the demo; your real history is never touched
@@ -4740,7 +6263,7 @@ function History.askClear()
 	end
 	if not StaticPopupDialogs.ROLLFRAMES_CLEAR_HISTORY then
 		StaticPopupDialogs.ROLLFRAMES_CLEAR_HISTORY = {
-			text = "Clear the loot history?\n\nEvery decided drop leaves the list and History. Rolls in progress stay.",
+			text = "Clear History?\n\nThis character's finished drops leave the list and History for good. Rolls in progress stay.",
 			button1 = "Clear", button2 = CANCEL or "Cancel",
 			OnAccept = function() History.clear() end,
 			timeout = 0, whileDead = true, hideOnEscape = true, preferredIndex = 3,
@@ -4749,19 +6272,18 @@ function History.askClear()
 	StaticPopup_Show("ROLLFRAMES_CLEAR_HISTORY")
 end
 
--- /rollframes reset all (user, 2026-11-10): back to a fresh install, after a confirmation: every setting, the
--- window's position and size, the first-use question (asked again), this character's loot History and the
--- troubleshooting log; then the interface reloads, so everything starts fresh. Other characters' History is
--- saved separately and stays.
+-- /rollframes reset all: back to a fresh install after a reload. Other characters' History is saved
+-- separately and stays.
 function History.askResetAll()
 	if not (StaticPopupDialogs and StaticPopup_Show) then
-		say("can't ask to confirm here, so nothing was reset.")
+		say("couldn't show the confirmation, so nothing was reset.")
 		return
 	end
 	if not StaticPopupDialogs.ROLLFRAMES_RESET_ALL then
 		StaticPopupDialogs.ROLLFRAMES_RESET_ALL = {
-			text = "Reset RollFrames completely?\n\nEvery setting (for all your characters) goes back to its default, "
-				.. "the window to its starting spot, and this character's loot History is cleared. The interface reloads.",
+			text = "Reset RollFrames completely?\n\nEvery setting goes back to its default on all your characters, and the "
+				.. "window to its starting spot. This character's History is cleared, and the first-use question and demo "
+				.. "come back. The interface reloads.",
 			button1 = "Reset everything", button2 = CANCEL or "Cancel",
 			OnAccept = function() History.resetAll() end,
 			timeout = 0, whileDead = true, hideOnEscape = true, showAlert = true, preferredIndex = 3,
@@ -4788,6 +6310,15 @@ function History.resetAll()
 		db.historySaved = next(others) and others or nil
 	end
 	ReloadUI()
+end
+
+-- (Not `w and (w.isSelf and true or false) or nil`: someone else's win would read nil, and a reload's
+-- backfill could then mark it yours.)
+function History.mineOf(winner)
+	if not winner then
+		return nil
+	end
+	return winner.isSelf and true or false
 end
 
 -- Every decided drop leaves the list and History. Rolls in progress (and drops still showing their
@@ -4818,6 +6349,8 @@ function History.clear()
 		dismissCard(card, "cleared")
 	end
 	lastActivity = GetTime()
+	relayoutPending = true -- (an empty window's text names History; it's gone now)
+	driver:Show()
 end
 
 -- Once a second while the window shows: decided drops older than "Finished drops stay" fade out of the
@@ -4833,7 +6366,7 @@ function History.fadeOld()
 		return
 	end
 	local now, old = GetTime(), nil
-	if keep > 0 and History.shown and History.touch and now - History.touch >= keep and not tweens["history:rows"] then
+	if keep > 0 and History.shown and History.touch and now - History.touch >= keep and not History.ageing then
 		History.ageOut()
 	end
 	for _, card in ipairs(cards) do
@@ -4850,7 +6383,7 @@ function History.fadeOld()
 end
 
 -- The window faded out by itself: every decided drop goes to History now, instead of waiting out "Finished
--- drops stay", so the next roll opens on a clean list (user, 2026-11-10). "Until cleared" keeps them, and
+-- drops stay", so the next roll opens on a clean list. "Until cleared" keeps them, and
 -- closing the window by hand changes nothing.
 function History.fadeAllDecided()
 	if (db.historyFade or 0) <= 0 then
@@ -4872,18 +6405,17 @@ function History.fadeAllDecided()
 	end
 end
 
--- Button guard (user, 2026-11-10): when the list moves (new loot) and a drop's roll buttons end up under a
--- cursor that didn't move, they're dimmed and ignore clicks until the mouse moves a button's width (22 px)
--- or the setting's time passes (db.guardTime; 0: the mouse must move), so someone resting the mouse there
--- isn't left wondering,
--- so a click meant for another drop can't land on them. The drop under the mouse that held still isn't
--- guarded (it didn't move). Runs one frame after a layout that moved drops, and only while guarding.
--- Ends every guard at once (the setting turned off).
+-- Click guard: when the list moves and a drop's roll buttons slide under a still cursor, they dim and
+-- ignore clicks until the mouse moves a button's width (22 px) or db.guardTime passes (0: until it
+-- moves), so a click meant for another drop can't land on them. checkGuard runs one frame after a
+-- layout that moved drops.
+-- clearGuards: ends every guard at once (the setting turned off).
 function History.clearGuards()
 	for _, card in ipairs(cards) do
 		if card.guarded then
 			card.guarded = nil
 			card.buttons:SetAlpha(1)
+			Scale.refreshGlow(card)
 			History.refreshButtonTip(card)
 		end
 	end
@@ -4896,7 +6428,7 @@ end
 -- (the mouse didn't move, so the button wouldn't redraw it by itself).
 function History.refreshButtonTip(card)
 	for _, button in ipairs(card.buttons.list) do
-		if GameTooltip:IsOwned(button) then
+		if History.hoverButton == button then
 			button:GetScript("OnEnter")(button)
 			return
 		end
@@ -4917,6 +6449,7 @@ function History.checkGuard()
 			else
 				card.guarded = { x = x, y = y, at = now }
 				card.buttons:SetAlpha(0.35)
+				Scale.refreshGlow(card) -- no glow or hover highlight while guarded (not only through the tooltip)
 				History.guards = (History.guards or 0) + 1
 				History.refreshButtonTip(card)
 			end
@@ -4941,6 +6474,7 @@ function History.watchGuards(watch)
 			if moved >= 22 or (limit > 0 and GetTime() - g.at >= limit) or not card.buttons:IsShown() then
 				card.guarded = nil
 				card.buttons:SetAlpha(1)
+				Scale.refreshGlow(card) -- the glow and highlight back on the button under the mouse
 				History.refreshButtonTip(card)
 			else
 				any = true
@@ -4965,8 +6499,12 @@ function History.row(i)
 	row.bg = row:CreateTexture(nil, "BACKGROUND")
 	row.bg:SetAllPoints()
 	row.bg:SetColorTexture(1, 1, 1, 0.035)
+	row.winTint = row:CreateTexture(nil, "BACKGROUND", nil, 1) -- (your win: the kept tint)
+	row.winTint:SetAllPoints()
+	History.setTint(row.winTint, History.KEPT_TINT)
+	row.winTint:Hide()
 	row.icon = row:CreateTexture(nil, "ARTWORK")
-	row.icon:SetSize(ICON, ICON)
+	row.icon:SetSize(Scale.iconSize, Scale.iconSize)
 	row.icon:SetPoint("TOPLEFT", row, "TOPLEFT", 3, -3)
 	row.icon:SetDesaturated(true) -- (older drops: a little quieter than the ones in the list)
 	row.ilvl = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -4977,7 +6515,7 @@ function History.row(i)
 	row.name:SetJustifyH("LEFT")
 	row.name:SetWordWrap(false)
 	row.when = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	row.when:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -6, 7) -- (the row grid: as on the drops)
+	row.when:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -6, Scale.lineTwo()) -- (the row grid: as on the drops)
 	row.boss = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	row.boss:SetPoint("RIGHT", row.when, "LEFT", -4, 0) -- (its own text: a shortened boss name never cuts the time)
 	row.boss:SetJustifyH("RIGHT")
@@ -4985,29 +6523,37 @@ function History.row(i)
 	row.winner = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	row.winner:SetPoint("BOTTOMLEFT", row.icon, "BOTTOMRIGHT", 24, 4)
 	row.winner:SetPoint("RIGHT", row.boss, "LEFT", -6, 0)
+	row.winRoll = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	row.winRoll:SetPoint("BOTTOMLEFT", row.icon, "BOTTOMRIGHT", 22, 4)
+	row.winRoll:SetWidth(History.rollWidth(row.winRoll))
+	row.winRoll:SetJustifyH("RIGHT")
 	row.winnerIcon = row:CreateTexture(nil, "OVERLAY")
 	row.winnerIcon:SetSize(14, 14)
-	row.winnerIcon:SetPoint("RIGHT", row.winner, "LEFT", -4, 0)
+	row.winRoll.choiceIcon = row.winnerIcon
 	row.winner:SetJustifyH("LEFT")
 	row.winner:SetWordWrap(false)
 	row:SetScript("OnEnter", function(self)
 		local e = self.entry
 		if not e then return end
 		History.tooltipBeside(self, self)
-		if e.demo or not e.link then
+		if not e.link then
 			GameTooltip:SetText(e.name or "Item")
 			if e.demo then GameTooltip:AddLine("Demo mode: a made-up item.", 0.8, 0.8, 0.8) end
 		else
 			GameTooltip:SetHyperlink(e.link)
+			if e.demo then GameTooltip:AddLine("Demo mode: nothing was rolled.", 0.8, 0.8, 0.8) end
 		end
 		GameTooltip:AddLine("Decided " .. History.when(e) .. (e.boss and (" · " .. e.boss) or ""), 0.6, 0.6, 0.6)
+		if e.winner and e.winner ~= "" then
+			GameTooltip:AddLine(e.winner, 1, 1, 1) -- (the row cuts a long name or boss short)
+		end
 		GameTooltip:Show()
 	end)
 	row:SetScript("OnLeave", GameTooltip_Hide)
 	row:SetScript("OnClick", function(self)
 		local e = self.entry
 		if e and e.link and not e.demo and IsModifiedClick() then
-			HandleModifiedItemClick(e.link) -- shift-click links it in chat, as on the list
+			History.itemClick(e.link) -- shift-click links it in chat, as on the list
 		end
 	end)
 	History.rows[i] = row
@@ -5080,7 +6626,13 @@ function History.place()
 			row.name:SetText(e.name or "Item")
 			row.name:SetTextColor(qualityColor(e.quality))
 			row.ilvl:SetText(e.ilvl or "")
-			row.winner:SetText(e.winner or "")
+			-- (yours, but saved before the winner text carried the checkmark: added here, so it never relies on colour)
+			local check = e.mine == true and e.winner and not e.winner:find("common-icon-checkmark", 1, true)
+			History.setWinnerLine(row.winRoll, row.winner, row.icon,
+				(e.winner or "") .. (check and " |A:common-icon-checkmark:12:12|a" or ""))
+			if row.winTint:IsShown() ~= (e.mine == true) then
+				row.winTint:SetShown(e.mine == true)
+			end
 			if e.atlas then
 				row.winnerIcon:SetAtlas(e.atlas)
 				row.winnerIcon:Show()
@@ -5100,7 +6652,7 @@ function History.place()
 		end
 		if row.alpha ~= alpha then
 			row.alpha = alpha
-			row:SetAlpha(alpha)
+			History.setAlpha(row, alpha)
 		end
 		if not row:IsShown() then
 			row:Show()
@@ -5133,10 +6685,7 @@ function Guard.tickFade()
 end
 -- The empty window's "Try the demo" button follows joining or leaving a group (no layout runs for that).
 function Guard.tickDemo()
-	local offer = main.emptyShown and not main.emptyLead and History.canDemo() and true or false
-	if main.demoButton:IsShown() ~= offer then
-		main.demoButton:SetShown(offer)
-	end
+	History.setDemoOffer(main.emptyShown and not main.emptyLead and History.canDemo())
 end
 local hideTicker = C_Timer.NewTicker(1, function()
 	if not main or not main:IsShown() then
@@ -5152,6 +6701,22 @@ end)
 -- Settings
 ----------------------------------------------------------------------------------------------------
 
+-- A setting indented under `parent` and greyed while `active()` is false. Not SetParentInitializer: it
+-- writes the `parentInitializer` field, which the Options search reads unprotected, so an addon's value
+-- there taints the search and the game blocks Blizzard's own Discord row. The indent and the live greying
+-- go through the GetParentInitializer method, which this provides instead.
+function History.under(init, parent, active)
+	if init.AddModifyPredicate then
+		init:AddModifyPredicate(active)
+	end
+	if parent and init.GetParentInitializer then
+		init.GetParentInitializer = function()
+			return parent
+		end
+	end
+end
+
+
 local category
 local settingObjects = {}
 -- The last value of each setting we've seen (our own table, not Blizzard's setting objects), so a callback
@@ -5161,7 +6726,6 @@ local seenValues = {}
 local function buildPanel()
 	local layoutPanel
 	category, layoutPanel = Settings.RegisterVerticalLayoutCategory("RollFrames")
-	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Window"))
 
 	local function checkbox(key, name, tooltip, onChange)
 		local s = Settings.RegisterAddOnSetting(category, "ROLLFRAMES_" .. key:upper(), key, db,
@@ -5188,45 +6752,68 @@ local function buildPanel()
 		end, tooltip)
 	end
 
+	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Rolling"))
 	checkbox("autoOpen", "Open when a roll starts",
-		"Shows the window whenever a group loot roll starts. Off: it stays out of the way and keeps track "
-			.. "quietly; open it yourself with /rollframes or the AddOns button, and everything is there. While "
-			.. "it's closed, Blizzard's own roll popups show as usual.")
+		"Shows the window when a group loot roll starts (default: on).\n\n"
+			.. "Off: the window stays closed but keeps track. Open it with the AddOns button by the minimap.\n\n"
+			.. "Also: /rollframes")
 	seenValues.rollFromWindow = db.rollFromWindow
 	local rollHereInit = checkbox("rollFromWindow", "Roll from this window",
-		"Adds Need, Greed and Pass buttons to each drop and hides Blizzard's roll popups while the window "
-			.. "is open. If RollFrames hits an error, or you close the window, Blizzard's popups come back.",
+		"Puts Need, Greed and Pass buttons on each drop (default: off).\n\n"
+			.. "While the window is open, Blizzard's roll popups stay hidden. Close the window and they come back.\n\n"
+			.. "If RollFrames hits a problem, Blizzard's popups take over until you reload the UI.\n\n"
+			.. "With a controller, you roll in the game's own gamepad roll list instead.",
 		function()
-			-- A real change here, either way, is the answer to the first-use question: never asked after.
-			-- (Blizzard's Settings also calls this when nothing changed, e.g. the Options "Defaults"
-			-- buttons; those aren't a choice, so only a change from the last known value counts.)
+			-- A real change, either way, answers the first-use question (seenValues: not a "Defaults" no-op).
 			if db.rollFromWindow ~= seenValues.rollFromWindow then
 				seenValues.rollFromWindow = db.rollFromWindow
 				db.askedRollHere = true
 				hideAsk(true) -- answered here (also releases a window the question opened)
 			end
 			applyBlizzardPopups() -- (first: turned off, the popups are back even if a drop below errors)
+			Guard.core("setting", Scale.restyleRows) -- (Large roll buttons only apply with this on)
 			for _, card in ipairs(cards) do
 				Guard.core("setting", refreshButtons, card)
 			end
 		end)
-	dropdown("playerLines", Settings.VarType.String, "Player lines",
-		{ { "summary", "Summary" }, { "auto", "Auto (raids: Summary)" }, { "all", "Everyone" },
-			{ "none", "None (item only)" } },
-		"How much of each roll in progress the window shows.\n\n"
-			.. "Summary (default): every drop is one steady row: the item, how many chose each (Need, Greed, Pass, "
-			.. "as their icons) and your own choice. Hover the drop for everyone's rolls.\n\n"
-			.. "Auto: Everyone in a party or solo, Summary in a raid, where a line for every raider would make each "
-			.. "drop taller than the window.\n\n"
-			.. "Everyone: a line per player with their choice and roll. You're on top, then rolls in the order they "
-			.. "came in, then players still deciding (...), then passes.\n\n"
-			.. "None: just the item, with your own choice and roll where the buttons were; hover the drop for "
-			.. "everyone's rolls.\n\nA drop keeps the same height while its roll is open, so the roll buttons don't move.",
+	local bigInit = dropdown("rollButtons", Settings.VarType.String, "Roll button size",
+		Scale.CHOICES,
+		"How big the Need, Greed and Pass buttons are.\n\n"
+			.. "Small: compact.\n"
+			.. "Medium (default): easier to hit.\n"
+			.. "Large: easier still.\n"
+			.. "Extra large: Blizzard's own size.\n\n"
+			.. "Bigger buttons make rows taller.\n\n"
+			.. "Needs \"Roll from this window\".",
 		function()
-			redrawLiveCards()
+			Guard.core("setting", Scale.restyleRows)
 		end)
+	local highlightInit = dropdown("highlightRolls", Settings.VarType.String, "Highlight drops to roll",
+		{ { "border", "Gold border" }, { "timer", "Glowing timer bar" }, { "sparkle", "Sparkles" },
+			{ "all", "All three" }, { "off", "Off" } },
+		"Makes drops waiting for your roll stand out. It goes as soon as you roll or the roll ends.\n\n"
+			.. "Gold border (default): a gold frame that slowly brightens and dims.\n"
+			.. "Glowing timer bar: the timer bar glows, with a spark at its edge.\n"
+			.. "Sparkles: twinkling stars around it.\n"
+			.. "All three: the border, the timer bar and the sparkles together.\n"
+			.. "Off: no highlight.\n\n"
+			.. "Needs \"Roll from this window\".",
+		function()
+			Highlight.restyle()
+		end)
+	local glowInit = checkbox("hoverGlow", "Glow on hovered buttons",
+		"Shows a soft gold glow behind the roll button under the mouse, so you can see which one you'll click "
+			.. "(default: on).\n\n"
+			.. "No glow on a greyed-out button, or while Click guard holds the buttons.\n\n"
+			.. "Needs \"Roll from this window\".",
+		function()
+			for _, card in ipairs(cards) do
+				Scale.refreshGlow(card) -- (on or off at once, under the mouse; nothing else, not the tooltips)
+			end
+		end)
+	local guardInit -- (indented under "Roll from this window", below)
 	do
-		-- Click guard: a checkbox with its time beside it (one row; Blizzard's own checkbox-and-dropdown control).
+		-- Click guard: a checkbox, and its time on the row under it.
 		local guardOn = Settings.RegisterAddOnSetting(category, "ROLLFRAMES_BUTTONGUARD", "buttonGuard", db,
 			Settings.VarType.Boolean, "Click guard", DEFAULTS.buttonGuard)
 		guardOn:SetValueChangedCallback(function()
@@ -5240,64 +6827,108 @@ local function buildPanel()
 		settingObjects.guardTime = guardTime
 		local function guardTimes()
 			local c = Settings.CreateControlTextContainer()
-			for _, t in ipairs({ { 0.5, "Half a second" }, { 1, "1 second" }, { 2, "2 seconds" }, { 3, "3 seconds" },
+			for _, t in ipairs({ { 0.5, "0.5 seconds" }, { 1, "1 second" }, { 2, "2 seconds" }, { 3, "3 seconds" },
 				{ 5, "5 seconds" }, { 0, "Until the mouse moves" } }) do
 				c:Add(t[1], t[2])
 			end
 			return c:GetData()
 		end
-		local tip = "When new loot moves the list and a drop's roll buttons slide under a mouse that didn't move, "
-			.. "they're dimmed and ignore clicks for a moment, so a click meant for one drop can't land on another. "
-			.. "They work again after the time chosen here (default: 2 seconds), or as soon as you move the mouse.\n\n"
-			.. "Until the mouse moves: no time limit; move the mouse a little and they work.\n\n"
-			.. "Off: buttons work the moment they're under the mouse."
-		local timeTip = "How long the guard lasts with the mouse still."
-		if CreateSettingsCheckboxDropdownInitializer then
-			layoutPanel:AddInitializer(CreateSettingsCheckboxDropdownInitializer(guardOn, "Click guard", tip,
-				guardTime, guardTimes, "Click guard time", timeTip))
-		else -- (two rows, the time greyed out while the guard is off)
-			local cbInit = Settings.CreateCheckbox(category, guardOn, tip)
-			local ddInit = Settings.CreateDropdown(category, guardTime, guardTimes, timeTip)
-			ddInit:SetParentInitializer(cbInit, function() return db.buttonGuard end)
+		local tip = "Stops misclicks when the list moves.\n\n"
+			.. "If a drop's roll buttons slide under a mouse that didn't move, they dim and ignore clicks. Move the "
+			.. "mouse, or wait the time chosen here, and they work again (default: on, 2 seconds).\n\n"
+			.. "Until the mouse moves: no time limit.\n"
+			.. "Off: the buttons work at once.\n\n"
+			.. "Needs \"Roll from this window\"."
+		local timeTip = "How long the buttons stay dimmed if the mouse doesn't move.\n\nNeeds \"Click guard\"."
+		-- Two rows, not Blizzard's checkbox-and-dropdown row: that row isn't searchable (no single setting to
+		-- take a name from), and lining its dropdown up meant a Resetter (see footerInitializer).
+		local cbInit = Settings.CreateCheckbox(category, guardOn, tip)
+		guardInit = cbInit
+		local ddInit = Settings.CreateDropdown(category, guardTime, guardTimes, timeTip)
+		-- (Blizzard re-checks a row when its parent changes: right whenever the page opens; a live switch of
+		-- Roll from this window shows on the time row the next time the page is drawn.)
+		History.under(ddInit, cbInit, function() return db.rollFromWindow and db.buttonGuard end)
+	end
+	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Window"))
+	-- (Saved key and values keep the old "Player lines" names, so choices carry over.)
+	dropdown("playerLines", Settings.VarType.String, "View",
+		{ { "summary", "Compact" }, { "auto", "Auto (raids: Compact)" }, { "all", "Detailed" },
+			{ "none", "Items only" } },
+		"What each roll shows while open.\n\n"
+			.. "Compact (default): one row per drop, with how many chose Need, Greed and Pass, and your own choice.\n\n"
+			.. "Auto: Detailed in a party or solo, Compact in a raid.\n\n"
+			.. "Detailed: a line per player with their choice and roll. You're first, then rolls as they come in, "
+			.. "then players still deciding, then passes.\n\n"
+			.. "Items only: just the item, with your own choice and roll.\n\n"
+			.. "Hover a drop (or its icon, with Item tooltip: Item icon only) to see the rolls. In a raid, that shows the "
+			.. "Need rolls.",
+		function()
+			redrawLiveCards()
+		end)
+	-- (No Position setting: saved "attached" choices move to the starting spot, Saved.MIGRATIONS[3].)
+	do
+		local size = Settings.RegisterAddOnSetting(category, "ROLLFRAMES_WINDOWSIZE", "windowSize", db,
+			Settings.VarType.Number, "Window size", DEFAULTS.windowSize)
+		size:SetValueChangedCallback(function()
+			Guard.core("setting", Scale.apply)
+		end)
+		settingObjects.windowSize = size
+		local tip = "Makes the whole window bigger or smaller: text, icons, roll buttons and rows (default: 100%).\n\n"
+			.. "The window keeps its place and stays on screen.\n\n"
+			.. "Also: /rollframes size 150"
+		if Settings.CreateSlider and Settings.CreateSliderOptions then
+			local options = Settings.CreateSliderOptions(Scale.MIN, Scale.MAX, 5)
+			local label = MinimalSliderWithSteppersMixin and MinimalSliderWithSteppersMixin.Label
+			if options.SetLabelFormatter and label and label.Right then
+				options:SetLabelFormatter(label.Right, function(value)
+					return string.format("%d%%", value)
+				end)
+			end
+			Settings.CreateSlider(category, size, options, tip)
+		else
+			Settings.CreateDropdown(category, size, function()
+				local c = Settings.CreateControlTextContainer()
+				for _, pct in ipairs({ 75, 90, 100, 110, 125, 150, 175, 200 }) do
+					c:Add(pct, pct .. "%")
+				end
+				return c:GetData()
+			end, tip)
 		end
 	end
-	dropdown("position", Settings.VarType.String, "Position",
-		{ { "free", "Free (drag anywhere)" }, { "attached", "Above roll popups" } },
-		"Free (default): until you drag it, the window sits on the right, beside the quest tracker, out of the way "
-			.. "of your action bars; drag its title bar to put it anywhere.\n\n"
-			.. "Above roll popups: its bottom edge sits just above Blizzard's roll popups (bottom middle of the "
-			.. "screen). Dragging the window switches it to Free.",
-		function()
-			if db.position == "attached" then
-				db.point = nil -- (back to Free later, or Defaults, starts from the starting spot)
-			end
-			applyPosition()
-			layout() -- grip to the right corner
-		end)
 	checkbox("autoGrow", "Grow with drops",
-		"Off (default): the window keeps one height, so it never changes size on its own; longer lists scroll, and "
-			.. "(with \"Roll from this window\") a bar at the edge says when drops waiting for your roll are out of "
-			.. "view. Drag the corner to set the height.\n\nOn: the window grows with its drops, up to the height you drag it to, then scrolls.",
+		"Off (default): the window keeps one height, and longer lists scroll. Drag its corner to set the height.\n\n"
+			.. "On: the window grows with its drops, up to the height you drag it to, then scrolls.",
 		function()
 			layout()
 		end)
+	checkbox("snapDrag", "Snap to whole rows",
+		"On: dragging the window's corner moves a whole row at a time, so the list never ends on a cut-off row.\n\n"
+			.. "Off (default): the corner goes exactly where you drag it.")
 	local autoHideInit = dropdown("autoHide", Settings.VarType.Number, "Hide when idle after",
 		{ { 0, "Never" }, { 10, "10 seconds" }, { 15, "15 seconds" }, { 30, "30 seconds" }, { 60, "60 seconds" } },
-		"Fades the window once every drop is decided and nothing has happened for this long; a thin line drains "
-			.. "under the title for the last few seconds. Hovering the window restarts the time, so it never fades under your mouse. A window you open "
-			.. "yourself stays until you close it (the pin by the close button shows this; click it to switch).",
+		"Hides the window, with a short fade, when every roll has ended and nothing happens for this long "
+			.. "(default: 15 seconds). A thin line under the title counts down the last seconds.\n\n"
+			.. "The time restarts while your mouse is over the window.\n\n"
+			.. "A window you open yourself stays until you close it. Click the pin by the close button to switch.\n\n"
+			.. "Never: it stays until you close it.",
 		function()
 			refreshPin()
 		end)
 	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("History"))
+	dropdown("historyFade", Settings.VarType.Number, "Finished drops stay",
+		{ { 30, "30 seconds" }, { 60, "1 minute" }, { 120, "2 minutes" }, { 300, "5 minutes" }, { 0, "Until cleared" } },
+		"How long a finished drop stays in the list before it moves to History, the clock in the title bar "
+			.. "(default: 1 minute).\n\n"
+			.. "Nothing moves while your mouse is over the window. If the window hides by itself, finished drops go to "
+			.. "History at once, so the next roll starts on a clean list.\n\n"
+			.. "Until cleared: up to 20 stay. Clear them with History's X.")
 	dropdown("historyMinQuality", Settings.VarType.Number, "Minimum quality kept",
 		{ { 0, "All items" }, { 2, "Uncommon and better" }, { 3, "Rare and better" }, { 4, "Epic and better" } },
-		"The lowest item quality kept in the history rows once a roll is decided.\n\nRolls for items of any "
-			.. "quality always show as normal, so you can still see and roll on them. This setting only decides "
-			.. "what stays in the list after the winner has shown: lower items fade out, and aren't kept in History "
-			.. "(the clock) either. Every drop is still in "
-			.. "Blizzard's loot history (/loot). Lowering it later doesn't bring back drops already left out.\n\n"
-			.. "Good for raids with lots of green or blue drops.",
+		"After a roll ends, drops below this quality fade from the list and aren't kept in History "
+			.. "(default: All items).\n\n"
+			.. "Rolls in progress always show, whatever the quality.\n\n"
+			.. "Every drop is still in Blizzard's loot history (/loot). Lowering this doesn't bring back drops "
+			.. "already left out.",
 		function()
 			local below = {}
 			for _, card in ipairs(cards) do
@@ -5310,9 +6941,10 @@ local function buildPanel()
 			end
 		end)
 	checkbox("keepTrash", "Keep trash drops",
-		"On: drops from trash stay in the history, like boss loot.\n\nOff: they leave the list once their winner has "
-			.. "shown, so the history keeps boss loot only. Rolls in progress always show, and every drop is still in "
-			.. "Blizzard's loot history (/loot).\n\nBoss drops show the boss's name in the history either way.",
+		"On (default): drops from trash stay in the list and in History, like boss loot.\n\n"
+			.. "Off: when its roll ends, a trash drop fades from the list and isn't kept in History. It's still in "
+			.. "Blizzard's loot history (/loot).\n\n"
+			.. "Boss drops show the boss's name.",
 		function()
 			local trash = {}
 			for _, card in ipairs(cards) do
@@ -5326,9 +6958,9 @@ local function buildPanel()
 		end)
 	dropdown("historyKeep", Settings.VarType.Number, "History keeps",
 		{ { 50, "50 drops" }, { 100, "100 drops" }, { 250, "250 drops" }, { 500, "500 drops" } },
-		"How many decided drops History (the clock in the title bar) keeps for this character. It's saved, so "
-			.. "it's still there after a reload or logging out. Once there are more, the oldest go.\n\n"
-			.. "Default: 100. The list itself keeps up to 20 decided rows; older ones are in History.", function()
+		"How many finished drops History keeps for this character (default: 100). History is the clock in the "
+			.. "title bar.\n\n"
+			.. "It's saved, so it's still there after a reload or logging out. When it's full, the oldest go.", function()
 			History.trimRecords()
 			if History.shown then
 				relayoutPending = true
@@ -5336,50 +6968,72 @@ local function buildPanel()
 			end
 		end)
 
-	dropdown("historyFade", Settings.VarType.Number, "Finished drops stay",
-		{ { 30, "30 seconds" }, { 60, "1 minute" }, { 120, "2 minutes" }, { 300, "5 minutes" }, { 0, "Until cleared" } },
-		"How long a decided drop stays in the list as a compact row before it fades out (default: 1 minute). "
-			.. "The clock in the title bar brings the older drops back, continuing the list; they go again after "
-			.. "the same time without you touching the window.\n\n"
-			.. "Never while the mouse is over the window, so nothing moves under it. When the window fades out "
-			.. "by itself, all decided drops go to History at once, so the next roll opens on a clean list.\n\n"
-			.. "Until cleared: rows stay until the X in the title bar removes them (the list keeps up to 20; older "
-			.. "ones are in History), even when the window fades out.")
 
-	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Accessibility"))
-	local highlightInit = dropdown("highlightRolls", Settings.VarType.String, "Highlight drops to roll",
-		{ { "border", "Gold border" }, { "timer", "Glowing timer bar" }, { "sparkle", "Sparkles" },
-			{ "all", "All three" }, { "off", "Off" } },
-		"Makes drops still waiting for your roll stand out, so you don't miss one. It shows only on drops with "
-			.. "your roll buttons, and goes as soon as you roll or the roll ends.\n\n"
-			.. "Gold border (default): a gold frame around the drop that slowly brightens and dims.\n\n"
-			.. "Glowing timer bar: the roll's timer bar glows, with a spark at its moving edge.\n\n"
-			.. "Sparkles: small stars twinkle around the drop's edge.\n\nAll three: all of them at once.\n\n"
-			.. "Needs \"Roll from this window\".",
+	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Tooltips"))
+	dropdown("itemTooltip", Settings.VarType.String, "Item tooltip",
+		{ { "drop", "Whole drop" }, { "icon", "Item icon only" } },
+		"Where a drop shows its item's tooltip, beside the window at the drop's top.\n\n"
+			.. "Whole drop (default): anywhere on the drop. It stays up as you move to the roll buttons.\n\n"
+			.. "Item icon only: only the item's icon, as on Blizzard's roll popup.\n\n"
+			.. "Comparing with what you have equipped follows the game: hold Shift, unless the game is set to always "
+			.. "compare.")
+	checkbox("buttonTips", "Roll button tooltips",
+		"On (default): a small tip by the roll button under your mouse says which roll it is, why you can't "
+			.. "choose it, or that the list just moved.\n\n"
+			.. "Off: no tip. The item's tooltip still shows, with Click guard's line while it holds.\n\n"
+			.. "Applies when Roll from this window is on.")
+	checkbox("tooltipGameSpot", "Tooltips at game's spot",
+		"On: the tooltips that open beside the window (a drop's item, a History row, the empty window's buttons) open "
+			.. "where the game shows its own (bottom right, unless you've moved them). Tooltip addons that move "
+			.. "tooltips apply here too.\n\n"
+			.. "Off (default): beside the window, level with the drop.\n\n"
+			.. "The small tips by the roll buttons stay by the buttons.")
+
+	layoutPanel:AddInitializer(CreateSettingsListSectionHeaderInitializer("Motion and flashing"))
+	checkbox("noMotion", "No animations",
+		"Everything appears, changes and goes at once: no fades, slides, sweeps, pulses or flashes "
+			.. "(default: off).\n\n"
+			.. "The roll timers still count down.\n\n"
+			.. "While it's on, Flashing and Sweep when a roll ends have no effect.",
 		function()
+			if db.noMotion then
+				History.finishTweens()
+				History.stopFlash()
+			end
 			Highlight.restyle()
 		end)
-	dropdown("flashing", Settings.VarType.String, "Flashing",
+	local flashInit = dropdown("flashing", Settings.VarType.String, "Flashing",
 		{ { "normal", "Normal" }, { "persist", "Until noticed" }, { "off", "Off" } },
-		"Normal (default): the highlight pulses, the \"more to roll\" bars pulse, the winner gets a short sweep "
-			.. "(with Player lines: Everyone), and "
-			.. "the window's edge flashes once when new loot brings it back from History.\n\n"
+		"Normal (default): highlights and the \"more to roll\" bars pulse. If new loot arrives while History is "
+			.. "open, the window's edge flashes once.\n\n"
 			.. "Until noticed: as Normal, but that flash repeats until you move the mouse over the window.\n\n"
-			.. "Off: nothing flashes or pulses. The highlight is a steady border or bar (Sparkles becomes a steady "
-			.. "border), the bars are steady, and the winner is simply highlighted.",
+			.. "Off: nothing flashes, pulses or sweeps. Highlights and bars stay steady; Sparkles shows as a gold border.",
 		function()
 			if db.flashing == "off" then
 				History.stopFlash()
 			end
 			Highlight.restyle()
 		end)
-	-- Greyed out unless you roll from the window. (Not SetParentInitializer: that also indents it under its
-	-- parent, which sits in another section; AddModifyPredicate only greys it.)
-	if highlightInit and highlightInit.AddModifyPredicate then
-		highlightInit:AddModifyPredicate(function()
-			return db.rollFromWindow
+	local sweepInit = checkbox("resultSweep", "Sweep when a roll ends",
+		"A soft band crosses the drop once when its roll ends (default: on).\n\n"
+			.. "Compact and Items only: gold if you win, grey if someone else does.\n"
+			.. "Detailed: gold on the winner's line.\n\n"
+			.. "Off: no sweep (your wins keep a tint).\n\n"
+			.. "Greyed while Flashing is Off: nothing sweeps then.")
+	if sweepInit and flashInit then
+		History.under(sweepInit, flashInit, function()
+			return db.flashing ~= "off"
 		end)
 	end
+	local function rollingHere()
+		return db.rollFromWindow
+	end
+	for _, init in ipairs({ bigInit, highlightInit, glowInit, guardInit }) do
+		if init then
+			History.under(init, rollHereInit, rollingHere)
+		end
+	end
+
 
 	layoutPanel:AddInitializer(footerInitializer())
 	Settings.RegisterAddOnCategory(category)
@@ -5394,7 +7048,8 @@ end
 -- are never asked.
 ----------------------------------------------------------------------------------------------------
 
-Ask = { W = WIDTH, H = 206, sampleTime = 30 } -- (one table: the file is near Lua's 200-locals limit)
+-- (H: the sample drop shows the default roll button size, whose row may be taller: Scale.LOOK.)
+Ask = { W = WIDTH, H = 206 + Scale.LOOK[DEFAULTS.rollButtons].extra, sampleTime = 30 } -- (one table: the file is near Lua's 200-locals limit)
 local ask -- the panel, made the first time it's needed
 
 function Ask.anyRealDrop(live)
@@ -5412,6 +7067,7 @@ function Ask.setRollFromWindow(on)
 	else
 		db.rollFromWindow = on
 		applyBlizzardPopups()
+		Guard.core("setting", Scale.restyleRows) -- (Large roll buttons only apply with this on)
 		for _, card in ipairs(cards) do
 			Guard.core("setting", refreshButtons, card)
 		end
@@ -5426,10 +7082,12 @@ function Ask.place()
 		return
 	end
 	local top, bottom, screenTop = main:GetTop(), main:GetBottom(), UIParent:GetTop()
+	screenTop = screenTop and Scale.toMain(UIParent, screenTop) -- (in the window's units: Window size)
+	local barsTop = bottomContainer() and Scale.toMain(bottomContainer(), bottomContainer():GetTop()) or 0
 	local where
 	if not (top and bottom and screenTop) or top + Ask.H + 8 <= screenTop then
 		where = "above"
-	elseif db.position ~= "attached" and bottom - Ask.H - 8 >= ((bottomContainer() and bottomContainer():GetTop()) or 0) then
+	elseif db.position ~= "attached" and bottom - Ask.H - 8 >= barsTop then
 		where = "below" -- (only if it stays above the action bars)
 	else
 		where = "over"
@@ -5455,14 +7113,14 @@ function Ask.create()
 	local f = CreateFrame("Frame", nil, main, "BackdropTemplate")
 	ask = f
 	f:SetSize(Ask.W, Ask.H)
-	f:SetFrameStrata("HIGH")
+	f:SetFrameStrata(main:GetFrameStrata()) -- (the window's layer: never over Options when the window isn't)
 	f:EnableMouse(true)
 	-- Drag it like the window's title bar: it moves the window (and switches it to Free, as dragging the
 	-- window does). Its buttons take their own clicks, so they never start a drag.
 	f:RegisterForDrag("LeftButton")
 	f:SetScript("OnDragStart", function(self)
 		self.dragging = true
-		main:GetScript("OnDragStart")(main)
+		History.startMove()
 	end)
 	f:SetScript("OnDragStop", function(self)
 		self.dragging = false
@@ -5487,20 +7145,21 @@ function Ask.create()
 	f.text:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -6)
 	f.text:SetWidth(Ask.W - 24)
 	f.text:SetJustifyH("LEFT")
-	f.text:SetText("Need, Greed and Pass buttons go on each drop here, and Blizzard's roll popups stay "
-		.. "hidden while this window is open: one clean place to see and roll. Try the sample:")
+	f.text:SetText("Adds Need, Greed and Pass buttons to each drop here. Blizzard's roll popups stay hidden while "
+		.. "this window is open, and come back when you close it. Try the sample:")
 
 	-- The sample drop: an item, a timer and the roll buttons. Clicking only shows what would happen.
 	local row = CreateFrame("Frame", nil, f)
 	f.sample = row
-	row:SetSize(Ask.W - 24, ICON + 6)
+	local look = Scale.LOOK[DEFAULTS.rollButtons] -- (the sample shows the buttons at the default size)
+	row:SetSize(Ask.W - 24, 34 + look.extra)
 	row:SetPoint("TOPLEFT", f.text, "BOTTOMLEFT", 0, -8)
 	row.bg = row:CreateTexture(nil, "BACKGROUND")
 	row.bg:SetAllPoints()
 	row.bg:SetColorTexture(1, 1, 1, 0.05)
 	row.icon = row:CreateTexture(nil, "ARTWORK")
-	row.icon:SetSize(ICON, ICON)
-	row.icon:SetPoint("LEFT", 3, 0)
+	row.icon:SetSize(look.icon or ICON, look.icon or ICON)
+	row.icon:SetPoint("TOPLEFT", 3, -3)
 	row.icon:SetTexture("Interface\\Icons\\INV_Sword_04")
 	row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	row.name:SetPoint("TOPLEFT", row.icon, "TOPRIGHT", 6, -2)
@@ -5511,21 +7170,22 @@ function Ask.create()
 	row.timer:SetStatusBarColor(1, 0.75, 0.1)
 	row.timer:SetMinMaxValues(0, 1)
 	row.timer:SetHeight(4)
-	row.timer:SetPoint("BOTTOMLEFT", row.icon, "BOTTOMRIGHT", 6, 1)
+	row.timer:SetPoint("BOTTOMLEFT", row.icon, "BOTTOMRIGHT", 6,
+		look.extra > 0 and (look.top - look.size - 3 + (look.icon or ICON)) or 1) -- (2 px under the buttons, as Scale.timerY)
 	row.timer:SetPoint("RIGHT", row, "RIGHT", -6, 0)
 	row.timer.bg = row.timer:CreateTexture(nil, "BACKGROUND")
 	row.timer.bg:SetAllPoints()
 	row.timer.bg:SetColorTexture(0, 0, 0, 0.5)
 	row.choice = row:CreateTexture(nil, "ARTWORK") -- your sample choice, where the buttons were
-	row.choice:SetSize(18, 18)
-	row.choice:SetPoint("TOPRIGHT", -8, -5)
+	row.choice:SetSize(look.size, look.size) -- (exactly where Pass was, at its size, as on a real drop)
+	row.choice:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4, look.top)
 	row.choice:Hide()
 	row.buttons = {}
 	for _, spec in ipairs(ROLL_BUTTONS) do
 		if spec.type ~= 4 then -- (no Transmog in the sample)
 			local b = CreateFrame("Button", nil, row)
-			b:SetSize(20, 20)
-			b:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4 - spec.spot * 22, -4)
+			b:SetSize(look.size, look.size)
+			b:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4 - spec.spot * look.step, look.top)
 			b:SetNormalAtlas(spec.atlas .. "-up")
 			b:SetHighlightAtlas(spec.atlas .. "-highlight")
 			b:SetPushedAtlas(spec.atlas .. "-down")
@@ -5536,7 +7196,7 @@ function Ask.create()
 				row.choice:SetAtlas(STATE_ATLAS[CLICK_STATE[spec.type]])
 				row.choice:Show()
 				row.timer:Hide()
-				f.note:SetText("That's it: one click on the drop itself. (Nothing was rolled.)")
+				f.note:SetText("That's it: one click on the drop. Nothing was rolled.")
 			end)
 			row.buttons[#row.buttons + 1] = b
 		end
@@ -5558,7 +7218,7 @@ function Ask.create()
 		db.askedRollHere = true
 		Ask.setRollFromWindow(true)
 		hideAsk(true)
-		say("rolling from this window. Change it any time: Options > AddOns > RollFrames.")
+		say("Roll from this window is on. Change it any time in Options > AddOns > RollFrames (Rolling).")
 	end)
 	f.no = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
 	f.no:SetSize(128, 22)
@@ -5571,7 +7231,7 @@ function Ask.create()
 	f.later = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	f.later:SetPoint("BOTTOM", 0, 10)
 	f.later:SetWidth(Ask.W - 24) -- (wraps rather than running past the panel's edges)
-	f.later:SetText("Change this any time in Options > AddOns > RollFrames.")
+	f.later:SetText("Change it any time: Options > AddOns > RollFrames, Roll from this window.")
 	f:Hide()
 end
 
@@ -5628,7 +7288,7 @@ maybeAsk = function(why)
 	return false
 end
 function Ask.maybe(why)
-	if askShown or db.askedRollHere or db.rollFromWindow or Guard.fallback or Guard.off.ask or InCombatLockdown() or Ask.anyRealDrop(true)
+	if askShown or db.askedRollHere or History.rollsHere() or Guard.fallback or Guard.off.ask or InCombatLockdown() or Ask.anyRealDrop(true)
 		or UnitIsDeadOrGhost("player") or GetTime() - (Ask.combatEnded or -100) < 5 -- (Feign Death, Vanish, a wipe)
 		or GetTime() - (Ask.lootAt or -100) < 10 -- (never right after loot)
 		or popupsOnScreen() then -- (Blizzard's roll popups up: a roll RollFrames may not know of, e.g. after /reload)
@@ -5686,10 +7346,28 @@ events:SetScript("OnEvent", function(self, event, ...)
 			RollFramesDB = RollFramesDB or {}
 			db = RollFramesDB
 			Saved.load(db) -- conversions, then only real choices are kept; the rest read as defaults
+			-- A size that's no longer offered or a damaged one: back to the
+			-- default, so the Options dropdown shows a real choice, not "Custom".
+			if rawget(db, "rollButtons") ~= nil and not Scale.LOOK[rawget(db, "rollButtons")] then
+				db.rollButtons = nil
+			end
+			Scale.setRows() -- (row height for the bigger roll buttons, before anything is built)
 			History.load()
 			createMain()
 			refreshPin()
 			main:HookScript("OnShow", applyBlizzardPopups)
+			-- Controller mode switched on or off (INPUT_DEVICE_INTERFACE_TRANSITION): roll buttons go or come back.
+			-- The plain event, not InputUtil's callbacks, which would write into Blizzard's own tables.
+			function History.controllerChanged()
+				applyBlizzardPopups()
+				Scale.restyleRows()
+				for _, card in ipairs(cards) do
+					refreshButtons(card)
+				end
+				History.updateStrata()
+				History.placeClock()
+			end
+			pcall(self.RegisterEvent, self, "INPUT_DEVICE_INTERFACE_TRANSITION")
 			main:HookScript("OnHide", applyBlizzardPopups)
 			-- Demo drops go when the window closes or fades out (not when the whole UI is hidden: Alt-Z).
 			main:HookScript("OnHide", function()
@@ -5720,7 +7398,7 @@ events:SetScript("OnEvent", function(self, event, ...)
 					hooksecurefunc("GroupLootContainer_Update", Guard.wrapCore("popups", function()
 						popupsOnScreen()
 						if db.position == "attached" and main:IsShown() then
-							relayoutPending = true -- more popups: less room above them (R32)
+							relayoutPending = true -- more popups: less room above them
 							driver:Show()
 						end
 					end))
@@ -5733,7 +7411,9 @@ events:SetScript("OnEvent", function(self, event, ...)
 			end
 			local ok, err = pcall(buildPanel)
 			if not ok then
-				say("settings panel unavailable, use /rollframes commands.", err)
+				pcall(Guard.note, "settings", err)
+				say("the settings page couldn't load. Your settings still apply; try /reload. /rollframes diag shows "
+					.. "the error for a bug report.")
 			end
 			self:RegisterEvent("LOOT_HISTORY_UPDATE_DROP")
 			self:RegisterEvent("START_LOOT_ROLL")
@@ -5762,11 +7442,8 @@ events:SetScript("OnEvent", function(self, event, ...)
 			end)
 			-- Asked at login (a few seconds in, so you see the window has arrived) while it's unanswered. In
 			-- combat it waits for the fight to end; with a roll up it waits for the next open or login.
-			if Saved.upgradeNote then -- (once, after an update from v1.1; REMOVE with Saved.showUpgradeNote)
-				C_Timer.After(6, Guard.wrap("ask", Saved.showUpgradeNote))
-			end
 			C_Timer.After(4, Guard.wrap("ask", function()
-				if not (db.askedRollHere or db.rollFromWindow) and not maybeAsk("login") and InCombatLockdown() then
+				if not (db.askedRollHere or History.rollsHere()) and not maybeAsk("login") and InCombatLockdown() then
 					askPutAway = true
 				end
 			end))
@@ -5774,7 +7451,7 @@ events:SetScript("OnEvent", function(self, event, ...)
 				pcall(self.RegisterEvent, self, "CONFIRM_LOOT_ROLL")
 			end
 			pcall(self.RegisterEvent, self, "CANCEL_ALL_LOOT_ROLLS")
-			-- Rolls made anywhere (Blizzard's popups, other addons) count against the twins pool (R38), and a
+			-- Rolls made anywhere (Blizzard's popups, other addons) count against the twins pool, and a
 			-- confirmed bind-on-pickup roll stays taken.
 			if RollOnLoot then
 				hooksecurefunc("RollOnLoot", Guard.wrapCore("RollOnLoot", function(rollID)
@@ -5818,22 +7495,21 @@ events:SetScript("OnEvent", function(self, event, ...)
 			onConfirmLootRoll(...)
 		elseif event == "PLAYER_ENTERING_WORLD" then
 			Guard.adoptRolls() -- rolls still open from before a /reload or a loading screen
+		elseif event == "INPUT_DEVICE_INTERFACE_TRANSITION" then
+			History.controllerChanged()
 		elseif event == "PLAYER_REGEN_DISABLED" then
 			Guard.call("ask", Ask.putAway, true) -- never in combat
 		elseif event == "PLAYER_REGEN_ENABLED" then
-			-- (Feign Death, Vanish or dying also end combat mid-fight: a put-away question comes back only
-			-- once you've been out of combat, and alive, for 5 s; otherwise at the next open or login.)
+			-- Feign Death, Vanish or dying also end combat mid-fight, so a put-away question gets one try 5 s
+			-- later, only if this is still the newest combat end (chain pulls); else next open or login.
 			Ask.combatEnded = GetTime()
 			if askPutAway then
-				-- One try, 5 s after the fight; if it can't show then, next open or login. Only the newest
-				-- end of combat counts (chain pulls), and a try that would land in the next fight waits for
-				-- that fight's own end instead.
 				local endedAt = Ask.combatEnded
 				C_Timer.After(5.5, Guard.wrap("ask", function()
 					if Ask.combatEnded ~= endedAt or InCombatLockdown() then
 						return
 					end
-					if askPutAway and not (db.askedRollHere or db.rollFromWindow) then
+					if askPutAway and not (db.askedRollHere or History.rollsHere()) then
 						maybeAsk("again")
 					end
 					askPutAway = false
@@ -5866,31 +7542,46 @@ end)
 ----------------------------------------------------------------------------------------------------
 
 local function diag()
+	local version = "?"
+	pcall(function()
+		local get = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
+		version = get and get(ADDON, "Version") or "?"
+	end)
+	local views = { summary = "Compact", auto = "Auto", all = "Detailed", none = "Items only" }
+	local here = History.rollsHere()
+	local pad = db.rollFromWindow and not here -- (on, but controller mode: the game's gamepad roll list)
+	say(string.format("status for a bug report (no names): version %s | View: %s | Roll from this window: %s | "
+		.. "window size %d%%", tostring(version), views[db.playerLines] or "?",
+		db.rollFromWindow and (pad and "on (controller mode)" or "on") or "off", math.floor(Scale.get() * 100 + 0.5)))
+	say("rolling in:", Guard.fallback and "Blizzard's popups (after an error)"
+		or (here and "this window" or (pad and "the game's gamepad roll list (controller mode)"
+			or "Blizzard's popups (Roll from this window is off)")))
 	local encounters = C_LootHistory.GetAllEncounterInfos() or {}
-	say("loot history encounters this session:", #encounters)
+	say("Blizzard's loot history this session:", #encounters, #encounters == 1 and "boss" or "bosses")
 	for _, e in ipairs(encounters) do
 		local drops = C_LootHistory.GetSortedDropsForEncounter(e.encounterID) or {}
 		say(string.format("  %s (id %s): %d drops", tostring(safe(e.encounterName, "?")), tostring(e.encounterID),
 			#drops))
 	end
-	say("cards:", #cards, "| log entries:", db.log and #db.log or 0, "| fallback:", tostring(Guard.fallback))
+	say("drops in the window:", #cards, "| troubleshooting log:", db.debugLog and "on" or "off", "(" ..
+		(db.log and #db.log or 0) .. " entries)")
 	local off = {}
 	for name in pairs(Guard.off) do
 		off[#off + 1] = name
 	end
 	table.sort(off)
-	say("switched off after an error this session:", #off > 0 and table.concat(off, ", ") or "nothing")
+	say("turned off after an error this session:", #off > 0 and table.concat(off, ", ") or "nothing")
 	if db.lastError then
 		say("last error:", db.lastError)
 	end
-	say("frames ever made:", framesMade.cards, "cards,", framesMade.lines, "lines | ready for reuse:", #cardPool,
-		"cards,", #linePool, "lines")
+	say("frames made:", framesMade.cards, "drop rows,", framesMade.lines, "player lines | spare:", #cardPool, "rows,",
+		#linePool, "lines")
 end
 
 --@debug@
 -- Twins demo (dev builds only): two copies of one item drop at the same moment and, as can happen in a
 -- raid, the loot history pairs them the wrong way round. Click a copy: your choice shows on the other
--- one, and the copy you clicked offers buttons again for your second roll (R38).
+-- one, and the copy you clicked offers buttons again for your second roll.
 local function runDemoTwins()
 	if demoBlocked() then
 		return
@@ -5903,7 +7594,7 @@ local function runDemoTwins()
 	local b = runDemoItem(item, { ownRoll = rollB, simRoll = rollA })
 	joinTwins(b, a)
 	say("demo twins: two copies of one item, paired the wrong way round."
-		.. (db.rollFromWindow and " Click Need on one: it shows on the other, and the one you clicked offers your second roll."
+		.. (History.rollsHere() and " Click Need on one: it shows on the other, and the one you clicked offers your second roll."
 			or " Turn on \"Roll from this window\" to roll on them."))
 end
 
@@ -6120,7 +7811,7 @@ function RollFrames_OnAddonCompartmentEnter(_, menuButton)
 	GameTooltip:SetText("RollFrames", 1, 1, 1)
 	local open = 0
 	for _, card in ipairs(cards) do
-		if not card.collapsed then
+		if not card.finished and not card.demo then -- (rolls really open: not the demo, not a winner still showing)
 			open = open + 1
 		end
 	end
@@ -6128,7 +7819,7 @@ function RollFrames_OnAddonCompartmentEnter(_, menuButton)
 		GameTooltip:AddLine(string.format("%d roll%s in progress", open, open == 1 and "" or "s"), 1, 0.82, 0)
 	end
 	GameTooltip:AddLine("Left-click: show or hide the window", 0.8, 0.8, 0.8)
-	GameTooltip:AddLine("Right-click: settings", 0.8, 0.8, 0.8)
+	GameTooltip:AddLine("Right-click: Options", 0.8, 0.8, 0.8)
 	GameTooltip:Show()
 end
 
@@ -6144,10 +7835,12 @@ SlashCmdList.ROLLFRAMES = function(input)
 	local command = strtrim(input or ""):lower()
 	if command == "demo" or command:match("^demo%s+%d+$") then
 		if Guard.off.demo then
-			say("the demo is off until you /reload (it hit a problem).")
+			say("the demo hit a problem and is off until you /reload.")
 		else
 			Guard.call("demo", runDemo, tonumber(command:match("%d+")) or 3)
 		end
+	elseif command == "options" and not category then
+		say("the settings page isn't available this session; try /reload.")
 	elseif command == "options" and category then
 		Settings.OpenToCategory(category:GetID())
 	elseif command == "reset all" then
@@ -6157,16 +7850,40 @@ SlashCmdList.ROLLFRAMES = function(input)
 		db.point = nil
 		db.maxHeight = nil
 		db.height = nil
+		if settingObjects.windowSize then
+			settingObjects.windowSize:SetValue(DEFAULTS.windowSize) -- (an open Options page follows)
+		end
+		db.windowSize = nil
+		main:SetScale(Scale.get())
 		applyPosition()
 		layout()
-		say("window position and size reset (on the right, beside the quest tracker).")
+		say("window back to its starting spot (right side, beside the quest tracker), starting height and 100% size.")
+	elseif command == "size" or command:match("^size%s") then
+		local want = tonumber(command:match("^size%s+(%d+)%%?$"))
+		if not want then
+			say("window size: " .. math.floor(Scale.get() * 100 + 0.5) .. "%. Change it with /rollframes size 75-200, "
+				.. "or in Options > AddOns > RollFrames (Window).")
+			return
+		end
+		local asked = want
+		want = math.max(Scale.MIN, math.min(Scale.MAX, math.floor(want / 5 + 0.5) * 5)) -- (the slider's steps)
+		if settingObjects.windowSize then
+			settingObjects.windowSize:SetValue(want) -- (calls Scale.apply; an open Options page follows)
+		else
+			db.windowSize = want
+		end
+		Scale.apply()
+		local why = asked > Scale.MAX and " (largest is 200%)" or asked < Scale.MIN and " (smallest is 75%)"
+			or asked ~= want and " (sizes go in steps of 5)" or ""
+		say("window size: " .. want .. "%" .. why)
 	elseif command == "blizzard" then
 		ToggleLootHistoryFrame()
 	elseif command == "diag" then
 		diag()
 	elseif command == "diag log" then
 		db.debugLog = not db.debugLog
-		say("troubleshooting log:", db.debugLog and "on (saved with your settings; no names)" or "off")
+		say(db.debugLog and "troubleshooting log on (no names). It's saved when you /reload or log out; /rollframes diag "
+			.. "log turns it off." or "troubleshooting log off.")
 	--@debug@
 	elseif command == "log" then
 		local entries = db.log or {}
@@ -6184,9 +7901,143 @@ SlashCmdList.ROLLFRAMES = function(input)
 	elseif command == "log clear" then
 		db.log = {}
 		say("log cleared.")
+	elseif command == "buttons" or command:match("^buttons%s") then
+		-- "/rollframes buttons" cycles the sizes, or name one. Same as the setting.
+		local want = command:match("^buttons%s+(%S+)$")
+		local at = 0
+		for i, choice in ipairs(Scale.CHOICES) do
+			if choice[1] == (want or db.rollButtons) then at = i end
+		end
+		if want and at == 0 then
+			local names = {}
+			for _, choice in ipairs(Scale.CHOICES) do names[#names + 1] = choice[1] end
+			say("roll button sizes:", table.concat(names, ", "))
+			return
+		end
+		want = want or Scale.CHOICES[at % #Scale.CHOICES + 1][1]
+		if settingObjects.rollButtons then
+			settingObjects.rollButtons:SetValue(want) -- (also updates an open Options page; restyles)
+		else
+			db.rollButtons = want
+			Guard.core("setting", Scale.restyleRows)
+		end
+		local look = Scale.LOOK[want] or Scale.look() -- (the chosen size, even with Roll from this window off)
+		say("roll buttons:", want, "(" .. look.size .. " px, " .. (look.step - look.size) .. " px apart, rows +"
+			.. look.extra .. ")", History.rollsHere() and "" or "(turn on Roll from this window to see them)")
+	elseif command == "demo real" or command:match("^demo real%s+%d+$") then
+		-- The demo with real items from this character's History (tooltips, item levels, Shift comparisons),
+		-- in the demo's usual order of boss, trash, 100 and all-pass drops. Made-up items when History has none.
+		local seen, real = {}, {}
+		for _, rec in ipairs(History.records) do
+			local link = rec.link
+			if type(link) == "string" and not isSecret(link) and link:find("|Hitem:", 1, true) and not seen[link] then
+				seen[link] = true
+				real[#real + 1] = link
+			end
+		end
+		for i = #real, 2, -1 do -- (a different mix each time)
+			local j = math.random(i)
+			real[i], real[j] = real[j], real[i]
+		end
+		local count = math.max(1, math.min(tonumber(command:match("%d+")) or 3, 20))
+		local items = {}
+		for i = 1, math.min(count, #real) do
+			local base = DEMO_ITEMS[(i - 1) % #DEMO_ITEMS + 1]
+			items[i] = { link = real[i], boss = base.boss, topRoll = base.topRoll, allPass = base.allPass }
+		end
+		if #items == 0 then
+			say("demo real: no items in this character's History yet, so the made-up ones.")
+		end
+		if Guard.off.demo then
+			say("the demo hit a problem and is off until you /reload.")
+		else
+			Guard.call("demo", runDemo, count, items)
+		end
+	elseif command == "lines" then
+		-- Troubleshooting Detailed view: each listed drop's player lines (counts, visibility, alpha, fades).
+		-- No names: line numbers only.
+		local ghosts = 0 -- (a pooled drop still showing would be a drop on screen that isn't listed below)
+		for _, c in ipairs(cardPool) do
+			if c.frame:IsShown() then ghosts = ghosts + 1 end
+		end
+		say("player lines per drop (View: " .. tostring(db.playerLines) .. ", No animations: " .. tostring(db.noMotion)
+			.. ", drops listed " .. #cards .. ", pooled drops still showing " .. ghosts .. "):")
+		for i, card in ipairs(cards) do
+			local n, shown, vis, low, fades, paused, offCard, under = 0, 0, 0, 1, 0, 0, 0, 0
+			local strata, tiny, noText, nameLow, unplaced = 0, 0, 0, 1, 0
+			for _, line in pairs(card.lines) do
+				n = n + 1
+				if line:GetFrameLevel() <= card.frame:GetFrameLevel() then under = under + 1 end
+				if line:GetFrameStrata() ~= card.frame:GetFrameStrata() then strata = strata + 1 end
+				if (line:GetWidth() or 0) < 1 or (line:GetHeight() or 0) < 1 then tiny = tiny + 1 end
+				if (line.name:GetText() or "") == "" then noText = noText + 1 end
+				if not line.name:IsVisible() then nameLow = 0 end
+				if not line:GetPoint(1) then unplaced = unplaced + 1 end
+				if line:IsShown() then shown = shown + 1 end
+				if line:IsVisible() then vis = vis + 1 end
+				low = math.min(low, line:GetAlpha(), line.name:GetAlpha())
+				if line:GetParent() ~= card.frame then offCard = offCard + 1 end
+				local f = line.rfFade
+				if f and f.group:IsPlaying() then fades = fades + 1 end
+				if f and f.group.IsPaused and f.group:IsPaused() then paused = paused + 1 end
+			end
+			say(string.format("%d: %s, mode %s, height %d, frame alpha %.2f, lines %d (shown %d, visible %d, lowest alpha %.2f, "
+				.. "fading %d, paused %d, not on this drop %d, under the drop %d), reserved %s, collapsed %s, pooled lines %d", i,
+				card.demo and "demo" or "real", tostring(card.linesMode), math.floor(card.frame:GetHeight() + 0.5),
+				card.frame:GetAlpha(), n, shown, vis, n > 0 and low or 1, fades, paused, offCard, under, tostring(card.reserved),
+				tostring(card.collapsed), #linePool))
+			say(string.format("   drop layer %s level %d; lines on another layer %d, no size %d, no name text %d, name not visible %s, "
+				.. "unanchored %d", card.frame:GetFrameStrata(), card.frame:GetFrameLevel(), strata, tiny, noText,
+				nameLow == 0 and "yes" or "no", unplaced))
+			-- Where the game actually draws them, the alpha it draws them with, and any engine animation on them.
+			local function call(f, method)
+				local ok, a, b, c, d = pcall(f[method] or function() end, f)
+				if ok then return a, b, c, d end
+			end
+			local cl, cb, cw, ch = call(card.frame, "GetRect")
+			local sl, sb, sw, sh = call(scroll, "GetRect")
+			local outside, offScreen, effLow, anims = 0, 0, 1, 0
+			local first
+			for _, key in ipairs(card.lineOrder) do
+				local line = card.lines[key]
+				if line then
+					local l, b, w, h = call(line, "GetRect")
+					first = first or { l, b, w, h }
+					if not (l and cl) or l + w < cl or l > cl + cw or b + h < cb or b > cb + ch then outside = outside + 1 end
+					if not (l and sl) or l + w < sl or l > sl + sw or b + h < sb or b > sb + sh then offScreen = offScreen + 1 end
+					effLow = math.min(effLow, call(line, "GetEffectiveAlpha") or 1, call(line.name, "GetEffectiveAlpha") or 1)
+					for _, g in ipairs({ call(line, "GetAnimationGroups") }) do
+						if g:IsPlaying() then anims = anims + 1 end
+					end
+				end
+			end
+			local dropAnims = 0
+			for _, g in ipairs({ call(card.frame, "GetAnimationGroups") }) do
+				if g:IsPlaying() then dropAnims = dropAnims + 1 end
+			end
+			local function num(v) return v and string.format("%.0f", v) or "?" end
+			say(string.format("   drop at %s,%s %sx%s; first line at %s,%s %sx%s; lines outside the drop %d, outside the list %d, "
+				.. "lowest drawn alpha %.2f, line animations playing %d, drop animations playing %d",
+				num(cl), num(cb), num(cw), num(ch), num(first and first[1]), num(first and first[2]), num(first and first[3]),
+				num(first and first[4]), outside, offScreen, effLow, anims, dropAnims))
+		end
+	elseif command == "columns" then
+		-- Try the winner line with the roll in its own column, and back.
+		History.ROLL_COLUMN = not History.ROLL_COLUMN
+		for _, card in ipairs(cards) do
+			card.winnerText.lineText = nil
+			if card.winnerFull then
+				History.setWinnerLine(card.winnerRoll, card.winnerText, card.icon, card.winnerFull)
+			end
+		end
+		for _, row in pairs(History.rows) do
+			row.winner.lineText = nil
+		end
+		relayoutPending = true
+		driver:Show()
+		say("winner roll column:", History.ROLL_COLUMN and "on" or "off")
 	elseif command == "highlight" or command:match("^highlight%s") then
-		-- Try the highlight styles: "/rollframes highlight" goes to the next one, or name it (border, timer,
-		-- sparkle, all, off). Same as the setting.
+		-- "/rollframes highlight" cycles the styles, or name one. Same as the setting.
 		local want = command:match("^highlight%s+(%a+)$")
 		if want and not Highlight.valid(want) then
 			say("highlight styles:", table.concat(Highlight.STYLES, ", "))
@@ -6203,7 +8054,7 @@ SlashCmdList.ROLLFRAMES = function(input)
 			db.highlightRolls = want
 		end
 		Highlight.restyle()
-		say("highlight:", want, db.rollFromWindow and "" or "(turn on Roll from this window to see it)")
+		say("highlight:", want, History.rollsHere() and "" or "(turn on Roll from this window to see it)")
 	elseif command == "demo twins" then
 		runDemoTwins()
 	elseif command:match("^fail") then
@@ -6267,6 +8118,8 @@ SlashCmdList.ROLLFRAMES = function(input)
 			maybeAsk("opened")
 		end
 	else
-		say("commands: /rollframes (show or hide) | demo [count] | options | reset (window spot and size) | reset all (everything, after asking) | blizzard | diag")
+		say("commands: /rollframes (show or hide) | demo [1-20] | options | size [75-200] | reset (window spot and size) "
+			.. "| reset all (everything, asks first) | blizzard (Blizzard's loot history) | diag (status for bug reports) "
+			.. "| diag log (troubleshooting log on/off)")
 	end
 end

@@ -1,5 +1,46 @@
 # RollFrames
 
+## v1.3.0
+
+### New
+All settings are under Options → AddOns → RollFrames. New options that are off by default change nothing until you turn them on, and the page's Defaults button puts every setting back.
+
+- **Roll button size:** Small, Medium, Large or Extra large (the size of Blizzard's own roll buttons). Medium is the new default; see Changed.
+- **Window size:** make the whole window anywhere from 75% to 200%. Text, icons, roll buttons and rows grow together, and the window stays on screen. It stays at 100% until you change it. Also `/rollframes size 150`.
+- **Glow on hovered buttons:** a soft gold glow behind the roll button under your mouse, so you can see which one a click will hit. It's on when you roll from the window, and you can turn it off.
+- **Tooltips:** a new section of settings. The item's tooltip shows over the whole drop, as before, or only over its icon if you prefer. A small tip by the roll button under your mouse says which roll it is, why it can't be chosen, or that the list just moved; it's on, and you can turn it off. Tooltips can also open where the game shows its own, if you turn that on.
+- **Sweep when a roll ends:** a soft band crosses the drop once: gold when you win, grey when someone else does (in Detailed, gold on the winner's line). It's on, and you can turn it off in Motion and flashing.
+- **Your wins stay marked:** a faint gold tint and a checkmark after your name, in the list and in History.
+- **A 100 lights up:** anyone's 100 plays a short burst on that drop's choice icon. With Flashing set to Off, it's a still glow instead.
+- **Animations can be turned off,** if you prefer: No animations in Motion and flashing is an accessibility option for motion sensitivity. Everything then appears, changes and goes at once, while the roll timers still count down. For just a little less motion, Flashing: Off and Sweep when a roll ends are there too.
+- **Don't show this again** under the empty window's Try the demo button hides the demo offer for good. `/rollframes demo` still plays it.
+
+### Changed
+- **Controller mode:** you roll in the game's own gamepad roll list; the window's roll buttons step aside while controller mode is on and come back when it's off.
+- **Bigger roll buttons if you roll from the window.** They're now Medium by default (25 px, up from 20), and each drop's row is a little taller. To go back: Options → AddOns → RollFrames → Roll button size: Small.
+- **"Above roll popups" is gone.** A window that sat above Blizzard's roll popups starts beside the quest tracker again; drag it anywhere, and it stays there.
+- **"Player lines" is now "View":** Compact (was Summary), Auto, Detailed (was Everyone) and Items only (was None). Your choice is kept.
+- **Settings grouped by task:** Rolling, Window, History, Tooltips, Motion and flashing. What needs Roll from this window sits under it, greyed out while it's off. Click guard and its time are two rows, and both can be found with the Options search.
+- **The window moves by its title bar.** Dragging elsewhere in the window no longer moves it, so a drag meant for the corner or the list can't shift it.
+- **Dragging the corner no longer snaps to whole rows:** it goes exactly where you drag it. For the old feel, tick Snap to whole rows (Window).
+- **The window keeps the height you drag it to** (unless Grow with drops is on), and changing the button size never resizes it. Its resize corner shows while the mouse is over the window.
+- **Options opens in front of the window.** While a drop waits for your roll, the window stays on top, like Blizzard's roll popups.
+- **Detailed view: after you roll, your choice takes the buttons' place,** as in Compact. Your roll number stays on your own line, with everyone's.
+- **A slim scrollbar,** shown only while the list scrolls. Rows no longer shift sideways when it appears.
+- Compact view's Need, Greed and Pass counts line up in columns down the list.
+- In a window you keep open, the demo's drops fade out a little after the last one is decided and leave nothing in History.
+- `/rollframes reset` also puts Window size back to 100%.
+- The roll highlights and the window's flash now run in the game's own animation engine, instead of being redrawn by the addon every frame.
+
+### Fixed
+- **No more "RollFrames has been blocked" in Options.** After opening RollFrames' settings, typing in the Options search or opening another page could get Blizzard's own Discord setting blocked, with RollFrames named. Settings now use Blizzard's plain section headers (hovering one shows its name, as on Blizzard's pages).
+- **Ctrl-click in combat** no longer prints "Interface action failed because of an AddOn": the game doesn't let addons open the dressing room in a fight, so the click does nothing then; Ctrl-click again after the fight (with the dressing room already open, it still previews).
+- Item comparison tooltips ("Equipped") open on the far side of the item's tooltip, not over the window and its roll buttons.
+- When someone chose Need, Greed choices never get a roll; once the roll is over they now show "-" instead of "…", which looked like they were still rolling. The demo follows the same rule.
+- The close button sits in the window's corner at every size.
+- Your roll number is centred beside your choice; roll icons in drop tooltips line up.
+- A damaged settings file no longer stops RollFrames at login: a broken value goes back to its default.
+
 ## v1.2.1
 
 - **Roll buttons in Blizzard's order.** Need, Greed and Pass now read left to right, with Pass on the right, like Blizzard's roll popup. Each still keeps a fixed spot on every drop.
